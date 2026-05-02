@@ -266,6 +266,94 @@ impl LlmClient {
     }
 }
 
+impl LlmClient {
+    /// Stream a single fill-in proposal that covers every `<!-- FILL: ... -->`
+    /// marker in `story.body`. The model receives the body with FILL markers
+    /// replaced by `[FILL #N: hint]` and must answer with `## #N` blocks.
+    /// Returns the raw accumulated text on success; the caller parses it with
+    /// `parse_fill_response` and applies it with `apply_fills`.
+    pub async fn stream_fill<F: FnMut(&str)>(
+        &self,
+        prompts_dir: &Path,
+        story: &Story,
+        ideas: &[Idea],
+        slots: &[FillSlot],
+        cancel: Arc<AtomicBool>,
+        mut on_delta: F,
+    ) -> Result<String> {
+        if slots.is_empty() {
+            return Err(anyhow::anyhow!("本文に `<!-- FILL: ... -->` がありません"));
+        }
+        let template = prompts::load_fill_template(prompts_dir)?;
+        let active = resolve_active_ideas(ideas, &story.meta.active_ideas);
+        let ideas_block = format_ideas(&active);
+        let body_block = body_with_numbered_markers(&story.body, slots);
+        let user_prompt = prompts::render(
+            &template,
+            &[("ideas", &ideas_block), ("body", &body_block)],
+        );
+
+        let mut builder = CreateChatCompletionRequestArgs::default();
+        builder
+            .model(&self.cfg.model)
+            .temperature(self.cfg.temperature)
+            .top_p(self.cfg.top_p)
+            .max_tokens(self.cfg.max_tokens)
+            .messages([ChatCompletionRequestUserMessageArgs::default()
+                .content(user_prompt)
+                .build()?
+                .into()]);
+        if self.cfg.disable_thinking {
+            builder.reasoning_effort(ReasoningEffort::None);
+        }
+        let request = builder.build()?;
+
+        let mut stream = self
+            .client
+            .chat()
+            .create_stream(request)
+            .await
+            .context("fill create_stream failed")?;
+
+        let mut accumulated = String::new();
+        let mut last_finish: Option<FinishReason> = None;
+        while let Some(chunk) = stream.next().await {
+            if cancel.load(Ordering::SeqCst) {
+                return Ok(accumulated);
+            }
+            let chunk = chunk.context("stream chunk error")?;
+            for choice in chunk.choices {
+                if let Some(reason) = choice.finish_reason {
+                    last_finish = Some(reason);
+                }
+                if let Some(content) = choice.delta.content {
+                    if !content.is_empty() {
+                        accumulated.push_str(&content);
+                        on_delta(&content);
+                    }
+                }
+            }
+        }
+
+        let visible = visible_text(&accumulated).0;
+        if visible.trim().is_empty() {
+            let hint = match last_finish {
+                Some(FinishReason::Length) => {
+                    "max_tokens に達した。設定を見直してください"
+                }
+                Some(FinishReason::ContentFilter) => {
+                    "content_filter で削除された (NSFW 拒否)。別モデルを検討してください"
+                }
+                _ => "プロンプト形式やテンプレートを確認してください",
+            };
+            return Err(anyhow::anyhow!(
+                "empty visible content (finish_reason={last_finish:?})\n→ {hint}"
+            ));
+        }
+        Ok(accumulated)
+    }
+}
+
 /// Split `body` into `(to_summarize, kept_recent)`. The split point is at most
 /// `keep_recent_chars` characters from the end, then snapped forward to the
 /// next paragraph break (`\n\n`) so prose is not cut mid-sentence.
@@ -293,6 +381,120 @@ pub fn split_for_compaction(body: &str, keep_recent_chars: usize) -> (String, St
             body[split_byte..].trim_start().to_string(),
         )
     }
+}
+
+/// A `<!-- FILL: hint -->` placeholder slot found in the body.
+#[derive(Debug, Clone)]
+pub struct FillSlot {
+    /// Byte range of the entire `<!-- FILL: ... -->` marker in the original body.
+    pub range: std::ops::Range<usize>,
+    /// Hint text after the colon (trimmed). Empty when the user wrote `<!-- FILL: -->`.
+    pub hint: String,
+}
+
+/// Find every `<!-- FILL: hint -->` marker in `body`, in document order.
+pub fn extract_fills(body: &str) -> Vec<FillSlot> {
+    let mut slots = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = body[i..].find("<!--") {
+        let start = i + rel;
+        let Some(rel_end) = body[start..].find("-->") else { break; };
+        let end = start + rel_end + 3;
+        let inside = &body[start + 4..start + rel_end];
+        let trimmed = inside.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("FILL") {
+            if let Some(hint_part) = rest.trim_start().strip_prefix(':') {
+                slots.push(FillSlot {
+                    range: start..end,
+                    hint: hint_part.trim().to_string(),
+                });
+            }
+        }
+        i = end;
+    }
+    slots
+}
+
+/// Render `body` with each FILL slot replaced by `[FILL #N: hint]` (or `[FILL #N]`
+/// when the hint is empty). The numbering matches the order of `slots`.
+pub fn body_with_numbered_markers(body: &str, slots: &[FillSlot]) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut last = 0;
+    for (i, slot) in slots.iter().enumerate() {
+        out.push_str(&body[last..slot.range.start]);
+        let n = i + 1;
+        if slot.hint.is_empty() {
+            out.push_str(&format!("[FILL #{n}]"));
+        } else {
+            out.push_str(&format!("[FILL #{n}: {}]", slot.hint));
+        }
+        last = slot.range.end;
+    }
+    out.push_str(&body[last..]);
+    out
+}
+
+/// Parse the model's fill response. Expected format: blocks separated by lines
+/// like `## #N` (or `##  #N`, etc.), with the prose for slot N on the lines that
+/// follow until the next header or end of input.
+pub fn parse_fill_response(text: &str) -> std::collections::HashMap<usize, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut current: Option<(usize, String)> = None;
+    let flush = |cur: &mut Option<(usize, String)>, map: &mut std::collections::HashMap<usize, String>| {
+        if let Some((n, buf)) = cur.take() {
+            let trimmed = buf.trim().to_string();
+            if !trimmed.is_empty() {
+                map.insert(n, trimmed);
+            }
+        }
+    };
+    for line in text.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("##") {
+            let rest = rest.trim_start();
+            if let Some(num_part) = rest.strip_prefix('#') {
+                let digit_end = num_part.find(|c: char| !c.is_ascii_digit()).unwrap_or(num_part.len());
+                if digit_end > 0 {
+                    if let Ok(n) = num_part[..digit_end].parse::<usize>() {
+                        flush(&mut current, &mut map);
+                        current = Some((n, String::new()));
+                        continue;
+                    }
+                }
+            }
+        }
+        if let Some((_, buf)) = current.as_mut() {
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            buf.push_str(line);
+        }
+    }
+    flush(&mut current, &mut map);
+    map
+}
+
+/// Substitute each FILL slot in `body` with the prose from `fills` (keyed by
+/// the 1-based slot number). Slots without a corresponding entry are left
+/// as-is (the original `<!-- FILL: ... -->` marker is preserved).
+pub fn apply_fills(
+    body: &str,
+    slots: &[FillSlot],
+    fills: &std::collections::HashMap<usize, String>,
+) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut last = 0;
+    for (i, slot) in slots.iter().enumerate() {
+        out.push_str(&body[last..slot.range.start]);
+        let n = i + 1;
+        match fills.get(&n) {
+            Some(text) => out.push_str(text),
+            None => out.push_str(&body[slot.range.clone()]),
+        }
+        last = slot.range.end;
+    }
+    out.push_str(&body[last..]);
+    out
 }
 
 /// Strip well-formed `<!-- ... -->` HTML comments (author's notes) from text.

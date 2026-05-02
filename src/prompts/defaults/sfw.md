@@ -17,6 +17,8 @@ The draft may contain HTML comments of the form `<!-- LABEL: body -->`. These ar
 - `DIGEST` — **synopsis of earlier text** that compaction replaced.
   - Treat its content as events that *already happened*; use it to keep continuity.
   - Do not rewrite the synopsis as prose (the reader has already read those events).
+- `FILL` — **placeholder slot** the author has not yet filled in.
+  - Treat it as a gap in the prose. Continue writing as if it will eventually be filled, but do not try to fill it yourself in the continuation.
 
 Never include `<!-- ... -->` in your output.
 

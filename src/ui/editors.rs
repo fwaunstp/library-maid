@@ -1,6 +1,9 @@
 use super::state::{AppState, Selection};
 use crate::data::frontmatter::FrontmatterDoc;
-use crate::llm::{LlmClient, resolve_active_ideas, strip_author_notes, visible_text};
+use crate::llm::{
+    LlmClient, apply_fills, extract_fills, parse_fill_response, resolve_active_ideas,
+    strip_author_notes, visible_text,
+};
 use chrono::Utc;
 use dioxus::prelude::*;
 use std::sync::Arc;
@@ -214,6 +217,22 @@ fn find_idx(props: &[Proposal], id: u64) -> Option<usize> {
     props.iter().position(|p| p.id == id)
 }
 
+#[derive(Debug, Clone)]
+struct FillProposal {
+    id: u64,
+    /// `(hint, generated_text)` per slot, in slot order. Pending slots are empty.
+    raw: String,
+    pending: bool,
+    error: Option<String>,
+    /// Snapshot of slot hints captured at request time, so display stays stable
+    /// even if the user edits the body while generation is in flight.
+    hints: Vec<String>,
+}
+
+fn find_fill_idx(props: &[FillProposal], id: u64) -> Option<usize> {
+    props.iter().position(|p| p.id == id)
+}
+
 #[component]
 pub fn StoryEditor(id: Ulid) -> Element {
     let mut state = use_context::<Signal<AppState>>();
@@ -228,6 +247,9 @@ pub fn StoryEditor(id: Ulid) -> Element {
     let mut compacting = use_signal(|| false);
     let mut compact_live = use_signal(String::new);
     let mut compact_error = use_signal::<Option<String>>(|| None);
+    let mut fill_proposals = use_signal::<Vec<FillProposal>>(Vec::new);
+    let mut fill_generating = use_signal(|| false);
+    let mut fill_error = use_signal::<Option<String>>(|| None);
 
     let disable_thinking = state.read().llm().disable_thinking;
     let (title, body, nsfw, all_ideas_with_status) = {
@@ -440,6 +462,86 @@ pub fn StoryEditor(id: Ulid) -> Element {
         }
     };
 
+    let on_fill = {
+        let cancel_flag = cancel_flag.clone();
+        let llm_cfg = llm_cfg.clone();
+        let prompts_dir = prompts_dir.clone();
+        move |_| {
+            let n = *count.read();
+            if n == 0 || *generating.read() || *auto_running.read() || *compacting.read() || *fill_generating.read() {
+                return;
+            }
+            let snapshot_story = state.read().story(id).cloned();
+            let snapshot_ideas = state.read().ideas.clone();
+            let Some(story) = snapshot_story else { return; };
+            let slots = extract_fills(&story.body);
+            if slots.is_empty() {
+                fill_error.set(Some("本文に `<!-- FILL: ... -->` がありません。「FILL を挿入」で穴を作ってください。".to_string()));
+                return;
+            }
+            cancel_flag.store(false, Ordering::SeqCst);
+            fill_generating.set(true);
+            fill_error.set(None);
+            let hints: Vec<String> = slots.iter().map(|s| s.hint.clone()).collect();
+            let llm_cfg = llm_cfg.clone();
+            let prompts_dir = prompts_dir.clone();
+            let cancel_flag = cancel_flag.clone();
+            spawn(async move {
+                let client = LlmClient::new(llm_cfg);
+                for _ in 0..n {
+                    if cancel_flag.load(Ordering::SeqCst) { break; }
+                    let pid = {
+                        let id = *next_proposal_id.read();
+                        next_proposal_id.set(id + 1);
+                        id
+                    };
+                    fill_proposals.write().push(FillProposal {
+                        id: pid,
+                        raw: String::new(),
+                        pending: true,
+                        error: None,
+                        hints: hints.clone(),
+                    });
+                    let on_delta = move |chunk: &str| {
+                        let mut p = fill_proposals.write();
+                        if let Some(idx) = find_fill_idx(&p, pid) {
+                            p[idx].raw.push_str(chunk);
+                        }
+                    };
+                    let result = client
+                        .stream_fill(
+                            &prompts_dir,
+                            &story,
+                            &snapshot_ideas,
+                            &slots,
+                            cancel_flag.clone(),
+                            on_delta,
+                        )
+                        .await;
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        let mut p = fill_proposals.write();
+                        if let Some(idx) = find_fill_idx(&p, pid) { p.remove(idx); }
+                        break;
+                    }
+                    let mut p = fill_proposals.write();
+                    if let Some(idx) = find_fill_idx(&p, pid) {
+                        match result {
+                            Ok(raw) => {
+                                p[idx].raw = raw;
+                                p[idx].pending = false;
+                            }
+                            Err(e) => {
+                                p[idx].pending = false;
+                                p[idx].error = Some(format!("{e:#}"));
+                            }
+                        }
+                    }
+                }
+                fill_generating.set(false);
+            });
+        }
+    };
+
     let on_cancel = {
         let cancel_flag = cancel_flag.clone();
         move |_| {
@@ -568,13 +670,25 @@ pub fn StoryEditor(id: Ulid) -> Element {
                             if let Ok(n) = e.value().parse::<u32>() { count.set(n.max(1).min(20)); }
                         },
                     }
-                    if *generating.read() || *auto_running.read() || *compacting.read() {
+                    button {
+                        disabled: *generating.read() || *auto_running.read() || *compacting.read() || *fill_generating.read(),
+                        onclick: on_fill,
+                        title: "本文中の `<!-- FILL: ... -->` 全部を1回のAPIで埋める。指定回数ぶん独立した案を生成",
+                        if *fill_generating.read() { "穴埋め中…" } else { "穴埋め生成" }
+                    }
+                    if *generating.read() || *auto_running.read() || *compacting.read() || *fill_generating.read() {
                         button { class: "danger", onclick: on_cancel, "キャンセル" }
                     }
                     if !proposals.read().is_empty() {
                         button {
                             onclick: move |_| proposals.set(Vec::new()),
                             "すべて破棄"
+                        }
+                    }
+                    if !fill_proposals.read().is_empty() {
+                        button {
+                            onclick: move |_| fill_proposals.set(Vec::new()),
+                            "穴埋め案を全破棄"
                         }
                     }
                     button {
@@ -594,8 +708,34 @@ pub fn StoryEditor(id: Ulid) -> Element {
                         },
                         "著者注を挿入"
                     }
+                    button {
+                        title: "本文末尾にプレースホルダー `<!-- FILL: ヒント -->` を挿入。AIに穴埋めしてもらう箇所",
+                        onclick: move |_| {
+                            let new_body = {
+                                let mut g = state.write();
+                                let Some(s) = g.story_mut(id) else { return; };
+                                if !s.body.is_empty() && !s.body.ends_with('\n') {
+                                    s.body.push('\n');
+                                }
+                                s.body.push_str("<!-- FILL: ここを埋める -->\n");
+                                s.body.clone()
+                            };
+                            save_story(state, id);
+                            push_body_to_dom(&new_body);
+                        },
+                        "FILL を挿入"
+                    }
                     span { style: "margin-left:auto; color:#8a8f99;",
-                        "案: {proposals.read().len()}"
+                        "案: {proposals.read().len()} / 穴埋め案: {fill_proposals.read().len()}"
+                    }
+                }
+                if let Some(err) = fill_error.read().clone() {
+                    div { style: "background:#3a1f22; border:1px solid #6b3030; border-radius:4px; padding:10px; color:#ffb0b0;",
+                        "穴埋め失敗: {err}"
+                        button { style: "margin-left: 8px;",
+                            onclick: move |_| fill_error.set(None),
+                            "閉じる"
+                        }
                     }
                 }
                 if let Some(err) = compact_error.read().clone() {
@@ -719,6 +859,101 @@ pub fn StoryEditor(id: Ulid) -> Element {
                                                     push_body_to_dom(&new_body);
                                                     let mut p = proposals.write();
                                                     if let Some(idx) = find_idx(&p, pid) { p.remove(idx); }
+                                                }
+                                            },
+                                            "採用"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for prop in fill_proposals.read().iter().cloned() {
+                    {
+                        let pid = prop.id;
+                        let (visible, in_think) = visible_text(&prop.raw);
+                        let parsed = if prop.pending { Default::default() } else { parse_fill_response(&visible) };
+                        rsx! {
+                            div {
+                                key: "fill-{pid}",
+                                class: if prop.pending { "proposal pending" } else { "proposal" },
+                                div { style: "color:#9aa0aa; font-size: 11px; margin-bottom: 4px;",
+                                    "穴埋め案: {prop.hints.len()} スロット"
+                                }
+                                if let Some(err) = prop.error.clone() {
+                                    div { class: "text", style: "color:#ff8080;", "エラー: {err}" }
+                                    div { class: "actions",
+                                        button {
+                                            onclick: move |_| {
+                                                let mut p = fill_proposals.write();
+                                                if let Some(idx) = find_fill_idx(&p, pid) { p.remove(idx); }
+                                            },
+                                            "閉じる"
+                                        }
+                                    }
+                                } else if prop.pending {
+                                    div { class: "text", style: "color:#8a8f99;",
+                                        if visible.trim().is_empty() {
+                                            if in_think { "考え中…" } else { "生成開始待ち…" }
+                                        } else {
+                                            "ストリーミング中… ({visible.len()} 文字受信)"
+                                            if in_think { " 〔思考中〕" }
+                                        }
+                                    }
+                                } else {
+                                    div { class: "text",
+                                        for (i, hint) in prop.hints.iter().enumerate() {
+                                            {
+                                                let n = i + 1;
+                                                let filled = parsed.get(&n).cloned().unwrap_or_default();
+                                                let label = if hint.is_empty() {
+                                                    format!("#{n}")
+                                                } else {
+                                                    format!("#{n}: {hint}")
+                                                };
+                                                let is_missing = filled.trim().is_empty();
+                                                rsx! {
+                                                    div {
+                                                        key: "{n}",
+                                                        style: "margin-bottom: 8px; padding-left: 8px; border-left: 2px solid #4a6cf7;",
+                                                        div { style: "color:#9aa0aa; font-size: 11px; margin-bottom: 2px;", "{label}" }
+                                                        if is_missing {
+                                                            div { style: "color:#ff8080; font-size: 12px;", "(モデルが #{n} を返さなかった — 採用すると元の FILL マーカーが残ります)" }
+                                                        } else {
+                                                            div { "{filled}" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    div { class: "actions",
+                                        button {
+                                            onclick: move |_| {
+                                                let mut p = fill_proposals.write();
+                                                if let Some(idx) = find_fill_idx(&p, pid) { p.remove(idx); }
+                                            },
+                                            "破棄"
+                                        }
+                                        button {
+                                            class: "primary",
+                                            disabled: parsed.is_empty(),
+                                            onclick: {
+                                                let parsed = parsed.clone();
+                                                move |_| {
+                                                    let new_body = {
+                                                        let mut g = state.write();
+                                                        let Some(s) = g.story_mut(id) else { return; };
+                                                        let slots = extract_fills(&s.body);
+                                                        let new = apply_fills(&s.body, &slots, &parsed);
+                                                        s.replace_body(new);
+                                                        s.body.clone()
+                                                    };
+                                                    save_story(state, id);
+                                                    push_body_to_dom(&new_body);
+                                                    let mut p = fill_proposals.write();
+                                                    if let Some(idx) = find_fill_idx(&p, pid) { p.remove(idx); }
                                                 }
                                             },
                                             "採用"

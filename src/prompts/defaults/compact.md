@@ -15,6 +15,8 @@ HTML comments `<!-- LABEL: body -->` in the source are author-only metadata. The
   - Do not summarize. Reproduce it **verbatim** at the corresponding position in the synopsis, so it continues to guide subsequent generations.
 - `DIGEST` — a **prior synopsis** from an earlier compaction.
   - Read its content as already-occurred events and fold it into the new synopsis (you may strip the wrapper and absorb the content into prose).
+- `FILL` — an **unfilled placeholder slot**.
+  - Preserve the `<!-- FILL: ... -->` block **verbatim** at its original position in the synopsis (do not invent content for it).
 
 # Settings in play
 {{ideas}}
