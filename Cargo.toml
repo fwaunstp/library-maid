@@ -1,0 +1,33 @@
+[package]
+name = "library-maid"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dioxus = { version = "0.7", features = ["desktop", "router"] }
+
+tokio = { version = "1", features = ["full"] }
+async-openai = { version = "0.36", default-features = false, features = ["rustls", "chat-completion"] }
+futures = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+serde_json = "1"
+
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+toml = "0.8"
+
+ulid = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+rfd = "0.17"
+
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

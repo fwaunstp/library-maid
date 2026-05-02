@@ -1,0 +1,258 @@
+use crate::data::{Idea, Story, story::Language};
+use crate::prompts::{self, PromptKey};
+use anyhow::{Context, Result};
+use async_openai::{
+    Client,
+    config::OpenAIConfig,
+    types::chat::{
+        ChatCompletionRequestUserMessageArgs,
+        CreateChatCompletionRequestArgs,
+        FinishReason,
+        ReasoningEffort,
+    },
+};
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use ulid::Ulid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LlmConfig {
+    pub api_base: String,
+    pub api_key: String,
+    pub model: String,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub max_tokens: u32,
+    /// When true, send `reasoning_effort=none` to ask the server to skip thinking.
+    /// llama.cpp maps this to `enable_thinking=false` for Qwen3 etc.
+    pub disable_thinking: bool,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            api_base: "http://127.0.0.1:8080/v1".into(),
+            api_key: "sk-no-key-required".into(),
+            model: "local".into(),
+            temperature: 0.9,
+            top_p: 0.95,
+            max_tokens: 4096,
+            disable_thinking: true,
+        }
+    }
+}
+
+impl LlmConfig {
+    pub async fn probe(&self) -> Result<Vec<String>> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        let url = format!("{}/models", self.api_base.trim_end_matches('/'));
+        let resp = client
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?
+            .error_for_status()
+            .with_context(|| format!("non-2xx from {url}"))?;
+        let json: serde_json::Value = resp.json().await.context("parse /models json")?;
+        let mut ids = Vec::new();
+        if let Some(arr) = json.get("data").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        Ok(ids)
+    }
+}
+
+pub struct LlmClient {
+    client: Client<OpenAIConfig>,
+    cfg: LlmConfig,
+}
+
+impl LlmClient {
+    pub fn new(cfg: LlmConfig) -> Self {
+        let openai_cfg = OpenAIConfig::new()
+            .with_api_base(cfg.api_base.clone())
+            .with_api_key(cfg.api_key.clone());
+        Self {
+            client: Client::with_config(openai_cfg),
+            cfg,
+        }
+    }
+
+    /// Stream a continuation, calling `on_delta` with each raw text chunk
+    /// (which may include `<think>...</think>` blocks). Stops early if `cancel` flips.
+    /// Returns the full accumulated raw text on success.
+    pub async fn stream_continuation<F: FnMut(&str)>(
+        &self,
+        prompts_dir: &Path,
+        story: &Story,
+        ideas: &[Idea],
+        cancel: Arc<AtomicBool>,
+        mut on_delta: F,
+    ) -> Result<String> {
+        let key = PromptKey {
+            language: story.meta.language,
+            nsfw: story.meta.nsfw,
+        };
+        let template = prompts::load_template(prompts_dir, key)?;
+
+        let active = resolve_active_ideas(ideas, &story.meta.active_ideas);
+        let ideas_block = format_ideas(&active, story.meta.language);
+        let body_block = if story.body.trim().is_empty() {
+            placeholder_empty_body(story.meta.language).to_string()
+        } else {
+            story.body.clone()
+        };
+
+        let user_prompt = prompts::render(
+            &template,
+            &[("ideas", &ideas_block), ("body", &body_block)],
+        );
+
+        let mut builder = CreateChatCompletionRequestArgs::default();
+        builder
+            .model(&self.cfg.model)
+            .temperature(self.cfg.temperature)
+            .top_p(self.cfg.top_p)
+            .max_tokens(self.cfg.max_tokens)
+            .messages([ChatCompletionRequestUserMessageArgs::default()
+                .content(user_prompt)
+                .build()?
+                .into()]);
+        if self.cfg.disable_thinking {
+            builder.reasoning_effort(ReasoningEffort::None);
+        }
+        let request = builder.build()?;
+
+        let mut stream = self
+            .client
+            .chat()
+            .create_stream(request)
+            .await
+            .context("create_stream failed")?;
+
+        let mut accumulated = String::new();
+        let mut last_finish: Option<FinishReason> = None;
+
+        while let Some(chunk) = stream.next().await {
+            if cancel.load(Ordering::SeqCst) {
+                return Ok(accumulated);
+            }
+            let chunk = chunk.context("stream chunk error")?;
+            for choice in chunk.choices {
+                if let Some(reason) = choice.finish_reason {
+                    last_finish = Some(reason);
+                }
+                if let Some(content) = choice.delta.content {
+                    if !content.is_empty() {
+                        accumulated.push_str(&content);
+                        on_delta(&content);
+                    }
+                }
+            }
+        }
+
+        let visible = visible_text(&accumulated).0;
+        if visible.trim().is_empty() {
+            let hint = match last_finish {
+                Some(FinishReason::Length) => {
+                    "max_tokens に達した。reasoning モデル (Qwen3, DeepSeek 等) が thinking で枠を使い切った可能性。\n対処: 設定の max_tokens を増やす / llama-server に `--reasoning-format none` を付けて起動 / 非 reasoning モデルを使う"
+                }
+                Some(FinishReason::ContentFilter) => {
+                    "content_filter で削除された (NSFW 拒否)。別モデルを検討してください"
+                }
+                _ => "プロンプト形式やテンプレートを確認してください",
+            };
+            return Err(anyhow::anyhow!(
+                "empty visible content (finish_reason={last_finish:?})\n→ {hint}"
+            ));
+        }
+        Ok(accumulated)
+    }
+}
+
+/// Strip `<think>...</think>` blocks from raw model output for display.
+/// Returns `(visible_text, currently_inside_unclosed_think_block)`.
+pub fn visible_text(raw: &str) -> (String, bool) {
+    let mut out = String::new();
+    let mut s = raw;
+    let mut in_think = false;
+    loop {
+        if in_think {
+            match s.find("</think>") {
+                Some(idx) => {
+                    s = &s[idx + "</think>".len()..];
+                    in_think = false;
+                }
+                None => return (out, true),
+            }
+        } else {
+            match s.find("<think>") {
+                Some(idx) => {
+                    out.push_str(&s[..idx]);
+                    s = &s[idx + "<think>".len()..];
+                    in_think = true;
+                }
+                None => {
+                    out.push_str(s);
+                    return (out, false);
+                }
+            }
+        }
+    }
+}
+
+/// Expand the user's explicit picks with `requires`-driven auto-activations.
+/// An idea auto-activates iff every id in its `requires` is already in the active set
+/// (transitively, until fixed point).
+pub fn resolve_active_ideas<'a>(all: &'a [Idea], explicit: &[Ulid]) -> Vec<&'a Idea> {
+    let mut active: HashSet<Ulid> = explicit.iter().copied().collect();
+    loop {
+        let mut added = false;
+        for idea in all {
+            if active.contains(&idea.meta.id) || idea.meta.requires.is_empty() {
+                continue;
+            }
+            if idea.meta.requires.iter().all(|r| active.contains(r)) {
+                active.insert(idea.meta.id);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    all.iter().filter(|i| active.contains(&i.meta.id)).collect()
+}
+
+fn format_ideas(ideas: &[&Idea], lang: Language) -> String {
+    if ideas.is_empty() {
+        return match lang {
+            Language::Ja => "（特になし）".to_string(),
+            Language::En => "(none)".to_string(),
+        };
+    }
+    let mut out = String::new();
+    for idea in ideas {
+        out.push_str(&format!("## {}\n{}\n\n", idea.meta.title, idea.body.trim()));
+    }
+    out.trim_end().to_string()
+}
+
+fn placeholder_empty_body(lang: Language) -> &'static str {
+    match lang {
+        Language::Ja => "（まだ本文はありません。冒頭から書き始めてください。）",
+        Language::En => "(No draft yet. Begin from the opening.)",
+    }
+}
