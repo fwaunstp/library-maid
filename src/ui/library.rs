@@ -175,12 +175,8 @@ fn StoryList() -> Element {
         .stories
         .iter()
         .map(|s| {
-            let lang = match s.meta.language {
-                crate::data::story::Language::Ja => "JA",
-                crate::data::story::Language::En => "EN",
-            };
             let nsfw = if s.meta.nsfw { "NSFW" } else { "SFW" };
-            (s.meta.id, s.meta.title.clone(), format!("{lang} · {nsfw}"))
+            (s.meta.id, s.meta.title.clone(), nsfw.to_string())
         })
         .collect();
     rsx! {

@@ -1,6 +1,5 @@
 use super::state::{AppState, Selection};
 use crate::data::frontmatter::FrontmatterDoc;
-use crate::data::story::Language;
 use crate::llm::{LlmClient, resolve_active_ideas, strip_author_notes, visible_text};
 use chrono::Utc;
 use dioxus::prelude::*;
@@ -231,7 +230,7 @@ pub fn StoryEditor(id: Ulid) -> Element {
     let mut compact_error = use_signal::<Option<String>>(|| None);
 
     let disable_thinking = state.read().llm().disable_thinking;
-    let (title, body, language, nsfw, all_ideas_with_status) = {
+    let (title, body, nsfw, all_ideas_with_status) = {
         let s = state.read();
         let Some(story) = s.story(id) else {
             return rsx! { div { class: "empty", "ストーリーが見つかりません" } };
@@ -247,7 +246,6 @@ pub fn StoryEditor(id: Ulid) -> Element {
         (
             story.meta.title.clone(),
             story.body.clone(),
-            story.meta.language,
             story.meta.nsfw,
             chips,
         )
@@ -459,16 +457,6 @@ pub fn StoryEditor(id: Ulid) -> Element {
                         if let Some(s) = state.write().story_mut(id) { s.meta.title = v; }
                     },
                     onblur: move |_| save_story(state, id),
-                }
-                select {
-                    value: match language { Language::Ja => "ja", Language::En => "en" },
-                    onchange: move |e| {
-                        let lang = if e.value() == "en" { Language::En } else { Language::Ja };
-                        if let Some(s) = state.write().story_mut(id) { s.meta.language = lang; }
-                        save_story(state, id);
-                    },
-                    option { value: "ja", "日本語" }
-                    option { value: "en", "English" }
                 }
                 label { style: "display: flex; gap: 4px; align-items: center;",
                     input { r#type: "checkbox", checked: nsfw,

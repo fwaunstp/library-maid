@@ -5,23 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use ulid::Ulid;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Language {
-    Ja,
-    En,
-}
-
-impl Default for Language {
-    fn default() -> Self { Language::Ja }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoryMeta {
     pub id: Ulid,
     pub title: String,
-    #[serde(default)]
-    pub language: Language,
     #[serde(default)]
     pub nsfw: bool,
     /// Ideas the user has explicitly turned on for this story.
@@ -51,7 +38,6 @@ impl Story {
             meta: StoryMeta {
                 id,
                 title,
-                language: Language::Ja,
                 nsfw: true,
                 active_ideas: Vec::new(),
                 created_at: now,

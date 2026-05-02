@@ -1,4 +1,4 @@
-use crate::data::{Idea, Story, story::Language};
+use crate::data::{Idea, Story};
 use crate::prompts::{self, PromptKey};
 use anyhow::{Context, Result};
 use async_openai::{
@@ -105,16 +105,13 @@ impl LlmClient {
         cancel: Arc<AtomicBool>,
         mut on_delta: F,
     ) -> Result<String> {
-        let key = PromptKey {
-            language: story.meta.language,
-            nsfw: story.meta.nsfw,
-        };
+        let key = PromptKey { nsfw: story.meta.nsfw };
         let template = prompts::load_template(prompts_dir, key)?;
 
         let active = resolve_active_ideas(ideas, &story.meta.active_ideas);
-        let ideas_block = format_ideas(&active, story.meta.language);
+        let ideas_block = format_ideas(&active);
         let body_block = if story.body.trim().is_empty() {
-            placeholder_empty_body(story.meta.language).to_string()
+            placeholder_empty_body().to_string()
         } else {
             story.body.clone()
         };
@@ -207,9 +204,9 @@ impl LlmClient {
             ));
         }
 
-        let template = prompts::load_compact_template(prompts_dir, story.meta.language)?;
+        let template = prompts::load_compact_template(prompts_dir)?;
         let active = resolve_active_ideas(ideas, &story.meta.active_ideas);
-        let ideas_block = format_ideas(&active, story.meta.language);
+        let ideas_block = format_ideas(&active);
         let user_prompt = prompts::render(
             &template,
             &[("ideas", &ideas_block), ("body", &to_summarize)],
@@ -373,12 +370,9 @@ pub fn resolve_active_ideas<'a>(all: &'a [Idea], explicit: &[Ulid]) -> Vec<&'a I
     all.iter().filter(|i| active.contains(&i.meta.id)).collect()
 }
 
-fn format_ideas(ideas: &[&Idea], lang: Language) -> String {
+fn format_ideas(ideas: &[&Idea]) -> String {
     if ideas.is_empty() {
-        return match lang {
-            Language::Ja => "（特になし）".to_string(),
-            Language::En => "(none)".to_string(),
-        };
+        return "(none)".to_string();
     }
     let mut out = String::new();
     for idea in ideas {
@@ -387,9 +381,6 @@ fn format_ideas(ideas: &[&Idea], lang: Language) -> String {
     out.trim_end().to_string()
 }
 
-fn placeholder_empty_body(lang: Language) -> &'static str {
-    match lang {
-        Language::Ja => "（まだ本文はありません。冒頭から書き始めてください。）",
-        Language::En => "(No draft yet. Begin from the opening.)",
-    }
+fn placeholder_empty_body() -> &'static str {
+    "(No draft yet. Begin from the opening.)"
 }
