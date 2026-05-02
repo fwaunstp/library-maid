@@ -94,20 +94,56 @@ impl LlmClient {
         }
     }
 
-    /// Stream a continuation, calling `on_delta` with each raw text chunk
-    /// (which may include `<think>...</think>` blocks). Stops early if `cancel` flips.
-    /// Returns the full accumulated raw text on success.
-    pub async fn stream_continuation<F: FnMut(&str)>(
+    /// Stream `count` independent candidate continuations of the draft in a
+    /// single API call. The model returns `# #1\n…\n# #2\n…` blocks; the
+    /// caller parses them with `parse_numbered_blocks`. Each candidate is an
+    /// alternative for the same draft (not a chain).
+    pub async fn stream_proposals<F: FnMut(&str)>(
         &self,
         prompts_dir: &Path,
         story: &Story,
         ideas: &[Idea],
+        count: u32,
         cancel: Arc<AtomicBool>,
-        mut on_delta: F,
+        on_delta: F,
     ) -> Result<String> {
         let key = PromptKey { nsfw: story.meta.nsfw };
         let template = prompts::load_template(prompts_dir, key)?;
+        self.stream_numbered(prompts_dir, story, ideas, &template, count, cancel, on_delta)
+            .await
+    }
 
+    /// Stream `count` sequential continuations in a single API call (auto-continue
+    /// mode). The model returns `# #1\n…\n# #2\n…` blocks where each block
+    /// picks up where the previous one ended. The caller appends them in order
+    /// to the draft.
+    pub async fn stream_auto_batch<F: FnMut(&str)>(
+        &self,
+        prompts_dir: &Path,
+        story: &Story,
+        ideas: &[Idea],
+        count: u32,
+        cancel: Arc<AtomicBool>,
+        on_delta: F,
+    ) -> Result<String> {
+        let key = PromptKey { nsfw: story.meta.nsfw };
+        let template = prompts::load_auto_template(prompts_dir, key)?;
+        self.stream_numbered(prompts_dir, story, ideas, &template, count, cancel, on_delta)
+            .await
+    }
+
+    /// Shared implementation for batched `# #N`-formatted output.
+    async fn stream_numbered<F: FnMut(&str)>(
+        &self,
+        _prompts_dir: &Path,
+        story: &Story,
+        ideas: &[Idea],
+        template: &str,
+        count: u32,
+        cancel: Arc<AtomicBool>,
+        mut on_delta: F,
+    ) -> Result<String> {
+        let count = count.max(1);
         let active = resolve_active_ideas(ideas, &story.meta.active_ideas);
         let ideas_block = format_ideas(&active);
         let body_block = if story.body.trim().is_empty() {
@@ -115,10 +151,14 @@ impl LlmClient {
         } else {
             story.body.clone()
         };
-
+        let count_str = count.to_string();
         let user_prompt = prompts::render(
-            &template,
-            &[("ideas", &ideas_block), ("body", &body_block)],
+            template,
+            &[
+                ("ideas", &ideas_block),
+                ("body", &body_block),
+                ("count", &count_str),
+            ],
         );
 
         let mut builder = CreateChatCompletionRequestArgs::default();
@@ -269,9 +309,9 @@ impl LlmClient {
 impl LlmClient {
     /// Stream a single fill-in proposal that covers every `<!-- FILL: ... -->`
     /// marker in `story.body`. The model receives the body with FILL markers
-    /// replaced by `[FILL #N: hint]` and must answer with `## #N` blocks.
+    /// replaced by `[FILL #N: hint]` and must answer with `# #N` blocks.
     /// Returns the raw accumulated text on success; the caller parses it with
-    /// `parse_fill_response` and applies it with `apply_fills`.
+    /// `parse_numbered_blocks` and applies it with `apply_fills`.
     pub async fn stream_fill<F: FnMut(&str)>(
         &self,
         prompts_dir: &Path,
@@ -434,10 +474,14 @@ pub fn body_with_numbered_markers(body: &str, slots: &[FillSlot]) -> String {
     out
 }
 
-/// Parse the model's fill response. Expected format: blocks separated by lines
-/// like `## #N` (or `##  #N`, etc.), with the prose for slot N on the lines that
-/// follow until the next header or end of input.
-pub fn parse_fill_response(text: &str) -> std::collections::HashMap<usize, String> {
+/// Parse `# #N`-delimited blocks (used for FILL, multi-proposals, and
+/// auto-batch). Each block's body is the lines after `# #N` up to the next
+/// header or end of input. Returns a map from N to body.
+///
+/// `#` (h1) is used rather than `##` (h2) because h1 is reserved for document
+/// titles in Markdown, so it almost never appears mid-prose — making it a
+/// safer delimiter that won't collide with the body's own headings.
+pub fn parse_numbered_blocks(text: &str) -> std::collections::HashMap<usize, String> {
     let mut map = std::collections::HashMap::new();
     let mut current: Option<(usize, String)> = None;
     let flush = |cur: &mut Option<(usize, String)>, map: &mut std::collections::HashMap<usize, String>| {
@@ -450,15 +494,18 @@ pub fn parse_fill_response(text: &str) -> std::collections::HashMap<usize, Strin
     };
     for line in text.lines() {
         let t = line.trim_start();
-        if let Some(rest) = t.strip_prefix("##") {
-            let rest = rest.trim_start();
-            if let Some(num_part) = rest.strip_prefix('#') {
-                let digit_end = num_part.find(|c: char| !c.is_ascii_digit()).unwrap_or(num_part.len());
-                if digit_end > 0 {
-                    if let Ok(n) = num_part[..digit_end].parse::<usize>() {
-                        flush(&mut current, &mut map);
-                        current = Some((n, String::new()));
-                        continue;
+        // Match exactly one `#` (h1), not `##`/`###` etc.
+        if let Some(rest) = t.strip_prefix('#') {
+            if !rest.starts_with('#') {
+                let rest = rest.trim_start();
+                if let Some(num_part) = rest.strip_prefix('#') {
+                    let digit_end = num_part.find(|c: char| !c.is_ascii_digit()).unwrap_or(num_part.len());
+                    if digit_end > 0 {
+                        if let Ok(n) = num_part[..digit_end].parse::<usize>() {
+                            flush(&mut current, &mut map);
+                            current = Some((n, String::new()));
+                            continue;
+                        }
                     }
                 }
             }

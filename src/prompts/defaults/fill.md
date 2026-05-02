@@ -11,10 +11,10 @@ The draft contains numbered placeholders of the form `[FILL #N: hint]` (or `[FIL
 # Output format
 Strictly follow this format. One block per placeholder, in numeric order, no extra blocks:
 
-## #1
+# #1
 (prose for #1)
 
-## #2
+# #2
 (prose for #2)
 
 No preamble, no commentary, no meta-text.

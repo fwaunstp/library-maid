@@ -3,6 +3,8 @@ use std::path::Path;
 
 const NSFW: &str = include_str!("defaults/nsfw.md");
 const SFW: &str = include_str!("defaults/sfw.md");
+const AUTO_NSFW: &str = include_str!("defaults/auto_nsfw.md");
+const AUTO_SFW: &str = include_str!("defaults/auto_sfw.md");
 const COMPACT: &str = include_str!("defaults/compact.md");
 const FILL: &str = include_str!("defaults/fill.md");
 
@@ -48,6 +50,16 @@ pub fn load_compact_template(prompts_dir: &Path) -> Result<String> {
             .with_context(|| format!("read override prompt {override_path:?}"));
     }
     Ok(COMPACT.to_string())
+}
+
+pub fn load_auto_template(prompts_dir: &Path, key: PromptKey) -> Result<String> {
+    let filename = if key.nsfw { "auto_nsfw.md" } else { "auto_sfw.md" };
+    let override_path = prompts_dir.join(filename);
+    if override_path.exists() {
+        return std::fs::read_to_string(&override_path)
+            .with_context(|| format!("read override prompt {override_path:?}"));
+    }
+    Ok(if key.nsfw { AUTO_NSFW } else { AUTO_SFW }.to_string())
 }
 
 pub fn load_fill_template(prompts_dir: &Path) -> Result<String> {

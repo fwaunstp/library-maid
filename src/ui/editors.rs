@@ -1,7 +1,7 @@
 use super::state::{AppState, Selection};
 use crate::data::frontmatter::FrontmatterDoc;
 use crate::llm::{
-    LlmClient, apply_fills, extract_fills, parse_fill_response, resolve_active_ideas,
+    LlmClient, apply_fills, extract_fills, parse_numbered_blocks, resolve_active_ideas,
     strip_author_notes, visible_text,
 };
 use chrono::Utc;
@@ -300,44 +300,81 @@ pub fn StoryEditor(id: Ulid) -> Element {
             spawn(async move {
                 let Some(story) = snapshot_story else { generating.set(false); return; };
                 let client = LlmClient::new(llm_cfg);
-                for _ in 0..n {
-                    if cancel_flag.load(Ordering::SeqCst) { break; }
-                    let pid = {
-                        let id = *next_proposal_id.read();
-                        next_proposal_id.set(id + 1);
-                        id
-                    };
-                    proposals.write().push(Proposal {
-                        id: pid,
-                        raw: String::new(),
-                        pending: true,
-                        error: None,
-                    });
-                    let on_delta = move |chunk: &str| {
-                        let mut p = proposals.write();
-                        if let Some(idx) = find_idx(&p, pid) {
-                            p[idx].raw.push_str(chunk);
-                        }
-                    };
-                    let result = client
-                        .stream_continuation(
-                            &prompts_dir,
-                            &story,
-                            &snapshot_ideas,
-                            cancel_flag.clone(),
-                            on_delta,
-                        )
-                        .await;
-                    if cancel_flag.load(Ordering::SeqCst) {
-                        let mut p = proposals.write();
-                        if let Some(idx) = find_idx(&p, pid) { p.remove(idx); }
-                        break;
-                    }
+                let pid = {
+                    let id = *next_proposal_id.read();
+                    next_proposal_id.set(id + 1);
+                    id
+                };
+                proposals.write().push(Proposal {
+                    id: pid,
+                    raw: String::new(),
+                    pending: true,
+                    error: None,
+                });
+                let on_delta = move |chunk: &str| {
                     let mut p = proposals.write();
                     if let Some(idx) = find_idx(&p, pid) {
-                        match result {
-                            Ok(raw) => p[idx] = Proposal { id: pid, raw, pending: false, error: None },
-                            Err(e) => p[idx] = Proposal { id: pid, raw: String::new(), pending: false, error: Some(format!("{e}")) },
+                        p[idx].raw.push_str(chunk);
+                    }
+                };
+                let result = client
+                    .stream_proposals(
+                        &prompts_dir,
+                        &story,
+                        &snapshot_ideas,
+                        n,
+                        cancel_flag.clone(),
+                        on_delta,
+                    )
+                    .await;
+                if cancel_flag.load(Ordering::SeqCst) {
+                    let mut p = proposals.write();
+                    if let Some(idx) = find_idx(&p, pid) { p.remove(idx); }
+                    generating.set(false);
+                    return;
+                }
+                match result {
+                    Ok(raw) => {
+                        let visible = visible_text(&raw).0;
+                        let blocks = parse_numbered_blocks(&visible);
+                        let mut p = proposals.write();
+                        if let Some(idx) = find_idx(&p, pid) { p.remove(idx); }
+                        if blocks.is_empty() {
+                            // Model didn't follow the format — fall back to the whole text as one proposal.
+                            let pid_fallback = {
+                                let id = *next_proposal_id.read();
+                                next_proposal_id.set(id + 1);
+                                id
+                            };
+                            p.push(Proposal {
+                                id: pid_fallback,
+                                raw,
+                                pending: false,
+                                error: None,
+                            });
+                        } else {
+                            let mut keys: Vec<usize> = blocks.keys().copied().collect();
+                            keys.sort();
+                            for k in keys {
+                                let prose = blocks[&k].clone();
+                                let pid_block = {
+                                    let id = *next_proposal_id.read();
+                                    next_proposal_id.set(id + 1);
+                                    id
+                                };
+                                p.push(Proposal {
+                                    id: pid_block,
+                                    raw: prose,
+                                    pending: false,
+                                    error: None,
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let mut p = proposals.write();
+                        if let Some(idx) = find_idx(&p, pid) {
+                            p[idx] = Proposal { id: pid, raw: String::new(), pending: false, error: Some(format!("{e}")) };
                         }
                     }
                 }
@@ -358,54 +395,77 @@ pub fn StoryEditor(id: Ulid) -> Element {
             auto_progress.set((0, n));
             auto_live.set(String::new());
 
+            let snapshot_story = state.read().story(id).cloned();
             let snapshot_ideas = state.read().ideas.clone();
             let llm_cfg = llm_cfg.clone();
             let prompts_dir = prompts_dir.clone();
             let cancel_flag = cancel_flag.clone();
 
             spawn(async move {
+                let Some(story) = snapshot_story else { auto_running.set(false); return; };
                 let client = LlmClient::new(llm_cfg);
-                for i in 0..n {
-                    if cancel_flag.load(Ordering::SeqCst) { break; }
-                    auto_progress.set((i, n));
-                    auto_live.set(String::new());
-
-                    let Some(story) = state.read().story(id).cloned() else { break; };
-                    let on_delta = move |chunk: &str| {
-                        let mut s = auto_live.write();
-                        s.push_str(chunk);
-                    };
-                    let result = client
-                        .stream_continuation(
-                            &prompts_dir,
-                            &story,
-                            &snapshot_ideas,
-                            cancel_flag.clone(),
-                            on_delta,
-                        )
-                        .await;
-                    if cancel_flag.load(Ordering::SeqCst) { break; }
-                    match result {
-                        Ok(raw) => {
-                            let visible = strip_author_notes(&visible_text(&raw).0).trim().to_string();
-                            if visible.is_empty() {
-                                tracing::warn!("auto mode: empty visible content, stopping");
-                                break;
+                let on_delta = move |chunk: &str| {
+                    auto_live.write().push_str(chunk);
+                };
+                let result = client
+                    .stream_auto_batch(
+                        &prompts_dir,
+                        &story,
+                        &snapshot_ideas,
+                        n,
+                        cancel_flag.clone(),
+                        on_delta,
+                    )
+                    .await;
+                let cancelled = cancel_flag.load(Ordering::SeqCst);
+                match result {
+                    Ok(raw) => {
+                        let visible = visible_text(&raw).0;
+                        let blocks = parse_numbered_blocks(&visible);
+                        let mut keys: Vec<usize> = blocks.keys().copied().collect();
+                        keys.sort();
+                        let mut appended = 0u32;
+                        if keys.is_empty() && !cancelled {
+                            // Fallback: model didn't use the `# #N` format. Append the whole
+                            // visible text as a single block to avoid losing the work.
+                            let prose = strip_author_notes(&visible).trim().to_string();
+                            if !prose.is_empty() {
+                                let new_body = {
+                                    let mut g = state.write();
+                                    if let Some(s) = g.story_mut(id) {
+                                        s.append_body(&prose);
+                                        s.body.clone()
+                                    } else { String::new() }
+                                };
+                                if !new_body.is_empty() {
+                                    save_story(state, id);
+                                    push_body_to_dom(&new_body);
+                                    appended = 1;
+                                }
                             }
-                            let new_body = {
-                                let mut g = state.write();
-                                if let Some(s) = g.story_mut(id) {
-                                    s.append_body(&visible);
-                                    s.body.clone()
-                                } else { break; }
-                            };
-                            save_story(state, id);
-                            push_body_to_dom(&new_body);
+                        } else {
+                            for k in keys {
+                                let prose = strip_author_notes(&blocks[&k]).trim().to_string();
+                                if prose.is_empty() { continue; }
+                                let new_body = {
+                                    let mut g = state.write();
+                                    if let Some(s) = g.story_mut(id) {
+                                        s.append_body(&prose);
+                                        s.body.clone()
+                                    } else { break; }
+                                };
+                                save_story(state, id);
+                                push_body_to_dom(&new_body);
+                                appended += 1;
+                                auto_progress.set((appended, n));
+                            }
                         }
-                        Err(e) => {
-                            tracing::error!(?e, "auto mode generation failed");
-                            break;
+                        if appended == 0 {
+                            tracing::warn!("auto mode: no blocks parsed from response");
                         }
+                    }
+                    Err(e) => {
+                        tracing::error!(?e, "auto mode generation failed");
                     }
                 }
                 auto_progress.set((n, n));
@@ -873,7 +933,7 @@ pub fn StoryEditor(id: Ulid) -> Element {
                     {
                         let pid = prop.id;
                         let (visible, in_think) = visible_text(&prop.raw);
-                        let parsed = if prop.pending { Default::default() } else { parse_fill_response(&visible) };
+                        let parsed = if prop.pending { Default::default() } else { parse_numbered_blocks(&visible) };
                         rsx! {
                             div {
                                 key: "fill-{pid}",
