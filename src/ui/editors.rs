@@ -223,6 +223,9 @@ pub fn StoryEditor(id: Ulid) -> Element {
     let mut next_proposal_id = use_signal(|| 1u64);
     let cancel_flag = use_hook(|| Arc::new(AtomicBool::new(false)));
     let mut generating = use_signal(|| false);
+    let mut auto_running = use_signal(|| false);
+    let mut auto_progress = use_signal(|| (0u32, 0u32));
+    let mut auto_live = use_signal(String::new);
 
     let disable_thinking = state.read().llm().disable_thinking;
     let (title, body, language, nsfw, all_ideas_with_status) = {
@@ -257,6 +260,8 @@ pub fn StoryEditor(id: Ulid) -> Element {
 
     let on_generate = {
         let cancel_flag = cancel_flag.clone();
+        let llm_cfg = llm_cfg.clone();
+        let prompts_dir = prompts_dir.clone();
         move |_| {
             let n = *count.read();
             if n == 0 || *generating.read() { return; }
@@ -314,6 +319,75 @@ pub fn StoryEditor(id: Ulid) -> Element {
                     }
                 }
                 generating.set(false);
+            });
+        }
+    };
+
+    let on_auto = {
+        let cancel_flag = cancel_flag.clone();
+        let llm_cfg = llm_cfg.clone();
+        let prompts_dir = prompts_dir.clone();
+        move |_| {
+            let n = *count.read();
+            if n == 0 || *generating.read() || *auto_running.read() { return; }
+            cancel_flag.store(false, Ordering::SeqCst);
+            auto_running.set(true);
+            auto_progress.set((0, n));
+            auto_live.set(String::new());
+
+            let snapshot_ideas = state.read().ideas.clone();
+            let llm_cfg = llm_cfg.clone();
+            let prompts_dir = prompts_dir.clone();
+            let cancel_flag = cancel_flag.clone();
+
+            spawn(async move {
+                let client = LlmClient::new(llm_cfg);
+                for i in 0..n {
+                    if cancel_flag.load(Ordering::SeqCst) { break; }
+                    auto_progress.set((i, n));
+                    auto_live.set(String::new());
+
+                    let Some(story) = state.read().story(id).cloned() else { break; };
+                    let on_delta = move |chunk: &str| {
+                        let mut s = auto_live.write();
+                        s.push_str(chunk);
+                    };
+                    let result = client
+                        .stream_continuation(
+                            &prompts_dir,
+                            &story,
+                            &snapshot_ideas,
+                            cancel_flag.clone(),
+                            on_delta,
+                        )
+                        .await;
+                    if cancel_flag.load(Ordering::SeqCst) { break; }
+                    match result {
+                        Ok(raw) => {
+                            let visible = visible_text(&raw).0.trim().to_string();
+                            if visible.is_empty() {
+                                tracing::warn!("auto mode: empty visible content, stopping");
+                                break;
+                            }
+                            let new_body = {
+                                let mut g = state.write();
+                                if let Some(s) = g.story_mut(id) {
+                                    s.append_body(&visible);
+                                    s.body.clone()
+                                } else { break; }
+                            };
+                            save_story(state, id);
+                            push_body_to_dom(&new_body);
+                        }
+                        Err(e) => {
+                            tracing::error!(?e, "auto mode generation failed");
+                            break;
+                        }
+                    }
+                }
+                auto_progress.set((n, n));
+                auto_live.set(String::new());
+                auto_running.set(false);
             });
         }
     };
@@ -425,9 +499,23 @@ pub fn StoryEditor(id: Ulid) -> Element {
                 div { class: "gen-controls",
                     button {
                         class: "primary",
-                        disabled: *generating.read(),
+                        disabled: *generating.read() || *auto_running.read(),
                         onclick: on_generate,
-                        if *generating.read() { "生成中…" } else { "続きを生成" }
+                        title: "案を N 個生成して提示。採用したものだけ本文に追加",
+                        if *generating.read() { "生成中…" } else { "続きを生成 (案出し)" }
+                    }
+                    button {
+                        disabled: *generating.read() || *auto_running.read(),
+                        onclick: on_auto,
+                        title: "N 回連続で生成 → 自動で本文に追加。ボツ案なし",
+                        {
+                            let (done, total) = *auto_progress.read();
+                            if *auto_running.read() {
+                                rsx!{ "自動連投中… {done}/{total}" }
+                            } else {
+                                rsx!{ "自動連投" }
+                            }
+                        }
                     }
                     label { "回数:" }
                     input { r#type: "number", min: "1", max: "20",
@@ -436,7 +524,7 @@ pub fn StoryEditor(id: Ulid) -> Element {
                             if let Ok(n) = e.value().parse::<u32>() { count.set(n.max(1).min(20)); }
                         },
                     }
-                    if *generating.read() {
+                    if *generating.read() || *auto_running.read() {
                         button { class: "danger", onclick: on_cancel, "キャンセル" }
                     }
                     if !proposals.read().is_empty() {
@@ -447,6 +535,29 @@ pub fn StoryEditor(id: Ulid) -> Element {
                     }
                     span { style: "margin-left:auto; color:#8a8f99;",
                         "案: {proposals.read().len()}"
+                    }
+                }
+                if *auto_running.read() {
+                    {
+                        let live = auto_live.read().clone();
+                        let (visible, in_think) = visible_text(&live);
+                        let visible = visible.trim_start().to_string();
+                        rsx! {
+                            div { class: "proposal pending",
+                                div { class: "text",
+                                    if visible.is_empty() {
+                                        span { style: "color:#8a8f99;",
+                                            if in_think { "考え中…" } else { "生成開始待ち…" }
+                                        }
+                                    } else {
+                                        "{visible}"
+                                        span { style: "color:#8a8f99;",
+                                            if in_think { " 〔思考中〕" } else { " ▍" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 for prop in proposals.read().iter().cloned() {
