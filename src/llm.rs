@@ -260,16 +260,7 @@ impl LlmClient {
             ));
         }
 
-        let lang = story.meta.language;
-        let header = match lang {
-            Language::Ja => "〔ここまでのあらすじ要約〕",
-            Language::En => "[Summary of the story so far]",
-        };
-        let footer = match lang {
-            Language::Ja => "〔要約ここまで / 以下、続き〕",
-            Language::En => "[End summary / continuation follows]",
-        };
-        let mut new_body = format!("{header}\n{summary}\n{footer}");
+        let mut new_body = format!("<!-- DIGEST:\n{summary}\n-->");
         if !kept_recent.is_empty() {
             new_body.push_str("\n\n");
             new_body.push_str(&kept_recent);
@@ -304,6 +295,27 @@ pub fn split_for_compaction(body: &str, keep_recent_chars: usize) -> (String, St
             body[..split_byte].to_string(),
             body[split_byte..].trim_start().to_string(),
         )
+    }
+}
+
+/// Strip well-formed `<!-- ... -->` HTML comments (author's notes) from text.
+/// Defensive: prompts already tell the model not to emit them, but a misbehaving
+/// model occasionally echoes them. Unclosed `<!--` is left as-is so the user
+/// notices the mismatch.
+pub fn strip_author_notes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let Some(start) = rest.find("<!--") else {
+            out.push_str(rest);
+            return out;
+        };
+        let Some(rel_end) = rest[start..].find("-->") else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..start]);
+        rest = &rest[start + rel_end + 3..];
     }
 }
 

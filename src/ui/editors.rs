@@ -1,7 +1,7 @@
 use super::state::{AppState, Selection};
 use crate::data::frontmatter::FrontmatterDoc;
 use crate::data::story::Language;
-use crate::llm::{LlmClient, resolve_active_ideas, visible_text};
+use crate::llm::{LlmClient, resolve_active_ideas, strip_author_notes, visible_text};
 use chrono::Utc;
 use dioxus::prelude::*;
 use std::sync::Arc;
@@ -367,7 +367,7 @@ pub fn StoryEditor(id: Ulid) -> Element {
                     if cancel_flag.load(Ordering::SeqCst) { break; }
                     match result {
                         Ok(raw) => {
-                            let visible = visible_text(&raw).0.trim().to_string();
+                            let visible = strip_author_notes(&visible_text(&raw).0).trim().to_string();
                             if visible.is_empty() {
                                 tracing::warn!("auto mode: empty visible content, stopping");
                                 break;
@@ -589,6 +589,23 @@ pub fn StoryEditor(id: Ulid) -> Element {
                             "すべて破棄"
                         }
                     }
+                    button {
+                        title: "AIへの指示を本文末尾にHTMLコメントとして挿入。読者には見えず、生成時に指示として読まれる",
+                        onclick: move |_| {
+                            let new_body = {
+                                let mut g = state.write();
+                                let Some(s) = g.story_mut(id) else { return; };
+                                if !s.body.is_empty() && !s.body.ends_with('\n') {
+                                    s.body.push('\n');
+                                }
+                                s.body.push_str("<!-- NOTE: ここに指示を書く -->\n");
+                                s.body.clone()
+                            };
+                            save_story(state, id);
+                            push_body_to_dom(&new_body);
+                        },
+                        "著者注を挿入"
+                    }
                     span { style: "margin-left:auto; color:#8a8f99;",
                         "案: {proposals.read().len()}"
                     }
@@ -655,7 +672,7 @@ pub fn StoryEditor(id: Ulid) -> Element {
                     {
                         let pid = prop.id;
                         let (visible, in_think) = visible_text(&prop.raw);
-                        let visible = visible.trim_start().to_string();
+                        let visible = strip_author_notes(&visible).trim_start().to_string();
                         rsx! {
                             div {
                                 key: "{pid}",
