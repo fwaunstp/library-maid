@@ -226,6 +226,9 @@ pub fn StoryEditor(id: Ulid) -> Element {
     let mut auto_running = use_signal(|| false);
     let mut auto_progress = use_signal(|| (0u32, 0u32));
     let mut auto_live = use_signal(String::new);
+    let mut compacting = use_signal(|| false);
+    let mut compact_live = use_signal(String::new);
+    let mut compact_error = use_signal::<Option<String>>(|| None);
 
     let disable_thinking = state.read().llm().disable_thinking;
     let (title, body, language, nsfw, all_ideas_with_status) = {
@@ -392,6 +395,53 @@ pub fn StoryEditor(id: Ulid) -> Element {
         }
     };
 
+    let on_compact = {
+        let cancel_flag = cancel_flag.clone();
+        let llm_cfg = llm_cfg.clone();
+        let prompts_dir = prompts_dir.clone();
+        move |_| {
+            if *generating.read() || *auto_running.read() || *compacting.read() { return; }
+            cancel_flag.store(false, Ordering::SeqCst);
+            compacting.set(true);
+            compact_error.set(None);
+            compact_live.set(String::new());
+
+            let snapshot_story = state.read().story(id).cloned();
+            let snapshot_ideas = state.read().ideas.clone();
+            let llm_cfg = llm_cfg.clone();
+            let prompts_dir = prompts_dir.clone();
+            let cancel_flag = cancel_flag.clone();
+
+            spawn(async move {
+                let Some(story) = snapshot_story else { compacting.set(false); return; };
+                let client = LlmClient::new(llm_cfg);
+                let on_delta = move |chunk: &str| {
+                    compact_live.write().push_str(chunk);
+                };
+                let result = client
+                    .compact_body(&prompts_dir, &story, &snapshot_ideas, cancel_flag.clone(), on_delta)
+                    .await;
+                match result {
+                    Ok(new_body) => {
+                        {
+                            let mut g = state.write();
+                            if let Some(s) = g.story_mut(id) {
+                                s.replace_body(new_body.clone());
+                            }
+                        }
+                        save_story(state, id);
+                        push_body_to_dom(&new_body);
+                    }
+                    Err(e) => {
+                        compact_error.set(Some(format!("{e:#}")));
+                    }
+                }
+                compact_live.set(String::new());
+                compacting.set(false);
+            });
+        }
+    };
+
     let on_cancel = {
         let cancel_flag = cancel_flag.clone();
         move |_| {
@@ -505,7 +555,7 @@ pub fn StoryEditor(id: Ulid) -> Element {
                         if *generating.read() { "生成中…" } else { "続きを生成 (案出し)" }
                     }
                     button {
-                        disabled: *generating.read() || *auto_running.read(),
+                        disabled: *generating.read() || *auto_running.read() || *compacting.read(),
                         onclick: on_auto,
                         title: "N 回連続で生成 → 自動で本文に追加。ボツ案なし",
                         {
@@ -517,6 +567,12 @@ pub fn StoryEditor(id: Ulid) -> Element {
                             }
                         }
                     }
+                    button {
+                        disabled: *generating.read() || *auto_running.read() || *compacting.read(),
+                        onclick: on_compact,
+                        title: "本文の前半を要約に置き換えてコンテキスト消費を抑える。直近1500文字程度は残る",
+                        if *compacting.read() { "圧縮中…" } else { "圧縮" }
+                    }
                     label { "回数:" }
                     input { r#type: "number", min: "1", max: "20",
                         value: "{count}",
@@ -524,7 +580,7 @@ pub fn StoryEditor(id: Ulid) -> Element {
                             if let Ok(n) = e.value().parse::<u32>() { count.set(n.max(1).min(20)); }
                         },
                     }
-                    if *generating.read() || *auto_running.read() {
+                    if *generating.read() || *auto_running.read() || *compacting.read() {
                         button { class: "danger", onclick: on_cancel, "キャンセル" }
                     }
                     if !proposals.read().is_empty() {
@@ -535,6 +591,41 @@ pub fn StoryEditor(id: Ulid) -> Element {
                     }
                     span { style: "margin-left:auto; color:#8a8f99;",
                         "案: {proposals.read().len()}"
+                    }
+                }
+                if let Some(err) = compact_error.read().clone() {
+                    div { style: "background:#3a1f22; border:1px solid #6b3030; border-radius:4px; padding:10px; color:#ffb0b0;",
+                        "圧縮失敗: {err}"
+                        button { style: "margin-left: 8px;",
+                            onclick: move |_| compact_error.set(None),
+                            "閉じる"
+                        }
+                    }
+                }
+                if *compacting.read() {
+                    {
+                        let live = compact_live.read().clone();
+                        let (visible, in_think) = visible_text(&live);
+                        let visible = visible.trim_start().to_string();
+                        rsx! {
+                            div { class: "proposal pending",
+                                div { style: "color:#9aa0aa; font-size: 11px; margin-bottom: 4px;",
+                                    "圧縮中: 前半を要約に置換します"
+                                }
+                                div { class: "text",
+                                    if visible.is_empty() {
+                                        span { style: "color:#8a8f99;",
+                                            if in_think { "考え中…" } else { "要約開始待ち…" }
+                                        }
+                                    } else {
+                                        "{visible}"
+                                        span { style: "color:#8a8f99;",
+                                            if in_think { " 〔思考中〕" } else { " ▍" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 if *auto_running.read() {

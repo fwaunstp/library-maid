@@ -31,6 +31,9 @@ pub struct LlmConfig {
     /// When true, send `reasoning_effort=none` to ask the server to skip thinking.
     /// llama.cpp maps this to `enable_thinking=false` for Qwen3 etc.
     pub disable_thinking: bool,
+    /// Compaction: number of trailing characters of the body kept verbatim
+    /// (the rest gets summarized). Snapped forward to the next paragraph break.
+    pub compact_keep_recent_chars: usize,
 }
 
 impl Default for LlmConfig {
@@ -43,6 +46,7 @@ impl Default for LlmConfig {
             top_p: 0.95,
             max_tokens: 4096,
             disable_thinking: true,
+            compact_keep_recent_chars: 1500,
         }
     }
 }
@@ -179,6 +183,127 @@ impl LlmClient {
             ));
         }
         Ok(accumulated)
+    }
+}
+
+impl LlmClient {
+    /// Summarize the older portion of `body` and return a new body where
+    /// that portion is replaced with the summary, separated by `〔ここまでの要約〕…〔要約ここまで〕`
+    /// markers. The trailing `keep_recent_chars` characters (snapped forward
+    /// to the next paragraph break) are preserved verbatim.
+    pub async fn compact_body<F: FnMut(&str)>(
+        &self,
+        prompts_dir: &Path,
+        story: &Story,
+        ideas: &[Idea],
+        cancel: Arc<AtomicBool>,
+        mut on_delta: F,
+    ) -> Result<String> {
+        let (to_summarize, kept_recent) =
+            split_for_compaction(&story.body, self.cfg.compact_keep_recent_chars);
+        if to_summarize.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "本文が短すぎて圧縮できません (要約対象が空)。compact_keep_recent_chars を下げてください。"
+            ));
+        }
+
+        let template = prompts::load_compact_template(prompts_dir, story.meta.language)?;
+        let active = resolve_active_ideas(ideas, &story.meta.active_ideas);
+        let ideas_block = format_ideas(&active, story.meta.language);
+        let user_prompt = prompts::render(
+            &template,
+            &[("ideas", &ideas_block), ("body", &to_summarize)],
+        );
+
+        let mut builder = CreateChatCompletionRequestArgs::default();
+        builder
+            .model(&self.cfg.model)
+            .temperature(0.5)
+            .top_p(0.9)
+            .max_tokens(self.cfg.max_tokens)
+            .messages([ChatCompletionRequestUserMessageArgs::default()
+                .content(user_prompt)
+                .build()?
+                .into()]);
+        if self.cfg.disable_thinking {
+            builder.reasoning_effort(ReasoningEffort::None);
+        }
+        let request = builder.build()?;
+
+        let mut stream = self
+            .client
+            .chat()
+            .create_stream(request)
+            .await
+            .context("compact create_stream failed")?;
+
+        let mut accumulated = String::new();
+        while let Some(chunk) = stream.next().await {
+            if cancel.load(Ordering::SeqCst) {
+                return Err(anyhow::anyhow!("cancelled"));
+            }
+            let chunk = chunk.context("stream chunk error")?;
+            for choice in chunk.choices {
+                if let Some(content) = choice.delta.content {
+                    if !content.is_empty() {
+                        accumulated.push_str(&content);
+                        on_delta(&content);
+                    }
+                }
+            }
+        }
+
+        let summary = visible_text(&accumulated).0.trim().to_string();
+        if summary.is_empty() {
+            return Err(anyhow::anyhow!(
+                "要約結果が空でした。max_tokens を増やすかモデル/設定を見直してください"
+            ));
+        }
+
+        let lang = story.meta.language;
+        let header = match lang {
+            Language::Ja => "〔ここまでのあらすじ要約〕",
+            Language::En => "[Summary of the story so far]",
+        };
+        let footer = match lang {
+            Language::Ja => "〔要約ここまで / 以下、続き〕",
+            Language::En => "[End summary / continuation follows]",
+        };
+        let mut new_body = format!("{header}\n{summary}\n{footer}");
+        if !kept_recent.is_empty() {
+            new_body.push_str("\n\n");
+            new_body.push_str(&kept_recent);
+        }
+        Ok(new_body)
+    }
+}
+
+/// Split `body` into `(to_summarize, kept_recent)`. The split point is at most
+/// `keep_recent_chars` characters from the end, then snapped forward to the
+/// next paragraph break (`\n\n`) so prose is not cut mid-sentence.
+pub fn split_for_compaction(body: &str, keep_recent_chars: usize) -> (String, String) {
+    let total_chars = body.chars().count();
+    if total_chars <= keep_recent_chars {
+        return (body.to_string(), String::new());
+    }
+    let split_idx_chars = total_chars - keep_recent_chars;
+    let split_byte = body
+        .char_indices()
+        .nth(split_idx_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(body.len());
+    let after = &body[split_byte..];
+    if let Some(rel) = after.find("\n\n") {
+        let real_split = split_byte + rel + 2;
+        (
+            body[..real_split].trim_end().to_string(),
+            body[real_split..].trim_start().to_string(),
+        )
+    } else {
+        (
+            body[..split_byte].to_string(),
+            body[split_byte..].trim_start().to_string(),
+        )
     }
 }
 

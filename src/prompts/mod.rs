@@ -6,6 +6,8 @@ const NSFW_JA: &str = include_str!("defaults/nsfw_ja.md");
 const NSFW_EN: &str = include_str!("defaults/nsfw_en.md");
 const SFW_JA: &str = include_str!("defaults/sfw_ja.md");
 const SFW_EN: &str = include_str!("defaults/sfw_en.md");
+const COMPACT_JA: &str = include_str!("defaults/compact_ja.md");
+const COMPACT_EN: &str = include_str!("defaults/compact_en.md");
 
 #[derive(Debug, Clone, Copy)]
 pub struct PromptKey {
@@ -51,4 +53,20 @@ pub fn render(template: &str, vars: &[(&str, &str)]) -> String {
         out = out.replace(&format!("{{{{{k}}}}}"), v);
     }
     out
+}
+
+pub fn load_compact_template(prompts_dir: &Path, language: Language) -> Result<String> {
+    let filename = match language {
+        Language::Ja => "compact_ja.md",
+        Language::En => "compact_en.md",
+    };
+    let override_path = prompts_dir.join(filename);
+    if override_path.exists() {
+        return std::fs::read_to_string(&override_path)
+            .with_context(|| format!("read override prompt {override_path:?}"));
+    }
+    Ok(match language {
+        Language::Ja => COMPACT_JA,
+        Language::En => COMPACT_EN,
+    }.to_string())
 }
