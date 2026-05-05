@@ -98,7 +98,7 @@ impl LlmClient {
     /// single API call. The model returns `# #1\n…\n# #2\n…` blocks; the
     /// caller parses them with `parse_numbered_blocks`. Each candidate is an
     /// alternative for the same draft (not a chain).
-    pub async fn stream_proposals<F: FnMut(&str)>(
+    pub async fn stream_proposals<F: FnMut(&str) + Send>(
         &self,
         prompts_dir: &Path,
         story: &Story,
@@ -117,7 +117,7 @@ impl LlmClient {
     /// mode). The model returns `# #1\n…\n# #2\n…` blocks where each block
     /// picks up where the previous one ended. The caller appends them in order
     /// to the draft.
-    pub async fn stream_auto_batch<F: FnMut(&str)>(
+    pub async fn stream_auto_batch<F: FnMut(&str) + Send>(
         &self,
         prompts_dir: &Path,
         story: &Story,
@@ -133,7 +133,7 @@ impl LlmClient {
     }
 
     /// Shared implementation for batched `# #N`-formatted output.
-    async fn stream_numbered<F: FnMut(&str)>(
+    async fn stream_numbered<F: FnMut(&str) + Send>(
         &self,
         _prompts_dir: &Path,
         story: &Story,
@@ -228,7 +228,7 @@ impl LlmClient {
     /// that portion is replaced with the summary, separated by `〔ここまでの要約〕…〔要約ここまで〕`
     /// markers. The trailing `keep_recent_chars` characters (snapped forward
     /// to the next paragraph break) are preserved verbatim.
-    pub async fn compact_body<F: FnMut(&str)>(
+    pub async fn compact_body<F: FnMut(&str) + Send>(
         &self,
         prompts_dir: &Path,
         story: &Story,
@@ -312,7 +312,7 @@ impl LlmClient {
     /// replaced by `[FILL #N: hint]` and must answer with `# #N` blocks.
     /// Returns the raw accumulated text on success; the caller parses it with
     /// `parse_numbered_blocks` and applies it with `apply_fills`.
-    pub async fn stream_fill<F: FnMut(&str)>(
+    pub async fn stream_fill<F: FnMut(&str) + Send>(
         &self,
         prompts_dir: &Path,
         story: &Story,

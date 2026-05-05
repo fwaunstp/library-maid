@@ -6,7 +6,7 @@ mod llm;
 mod prompts;
 mod ui;
 
-fn main() {
+fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -14,12 +14,22 @@ fn main() {
         )
         .init();
 
-    let window = dioxus::desktop::WindowBuilder::new()
-        .with_title("library-maid")
-        .with_always_on_top(false);
-    let cfg = dioxus::desktop::Config::new().with_window(window);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
 
-    dioxus::LaunchBuilder::desktop()
-        .with_cfg(cfg)
-        .launch(ui::App);
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("library-maid")
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([900.0, 600.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "library-maid",
+        native_options,
+        Box::new(move |cc| Ok(Box::new(ui::App::new(cc, runtime)))),
+    )
 }

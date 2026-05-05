@@ -1,8 +1,12 @@
 use crate::config::AppConfig;
-use crate::data::{Category, Idea, Library, Story};
 use crate::data::frontmatter::FrontmatterDoc;
+use crate::data::{Category, Idea, Library, Story};
 use crate::llm::LlmConfig;
 use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
 use ulid::Ulid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,7 +18,9 @@ pub enum Tab {
 }
 
 impl Default for Tab {
-    fn default() -> Self { Tab::Ideas }
+    fn default() -> Self {
+        Tab::Ideas
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,7 +38,135 @@ pub enum Selection {
 }
 
 impl Default for Selection {
-    fn default() -> Self { Selection::None }
+    fn default() -> Self {
+        Selection::None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Proposal {
+    pub id: u64,
+    pub raw: String,
+    pub pending: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FillProposal {
+    pub id: u64,
+    pub raw: String,
+    pub pending: bool,
+    pub error: Option<String>,
+    pub hints: Vec<String>,
+}
+
+#[derive(Debug)]
+pub enum StoryEvent {
+    ProposalDelta { pid: u64, chunk: String },
+    ProposalsDone { placeholder_pid: u64, raw: String },
+    ProposalsError { placeholder_pid: u64, error: String },
+    ProposalsCancelled { placeholder_pid: u64 },
+
+    AutoDelta { chunk: String },
+    AutoDone { raw: String, cancelled: bool },
+    AutoError { error: String },
+
+    CompactDelta { chunk: String },
+    CompactDone { new_body: String },
+    CompactError { error: String },
+
+    FillDelta { pid: u64, chunk: String },
+    FillDone { pid: u64, raw: String },
+    FillError { pid: u64, error: String },
+    FillCancelled { pid: u64 },
+}
+
+pub struct StoryEditorState {
+    pub count: u32,
+    pub proposals: Vec<Proposal>,
+    pub fill_proposals: Vec<FillProposal>,
+    pub next_proposal_id: u64,
+
+    pub generating: bool,
+    pub auto_running: bool,
+    pub auto_progress: (u32, u32),
+    pub auto_live: String,
+
+    pub compacting: bool,
+    pub compact_live: String,
+    pub compact_error: Option<String>,
+
+    pub fill_generating: bool,
+    pub fill_error: Option<String>,
+
+    pub cancel_flag: Arc<AtomicBool>,
+    pub tx: mpsc::Sender<StoryEvent>,
+    pub rx: mpsc::Receiver<StoryEvent>,
+}
+
+impl StoryEditorState {
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            count: 3,
+            proposals: Vec::new(),
+            fill_proposals: Vec::new(),
+            next_proposal_id: 1,
+            generating: false,
+            auto_running: false,
+            auto_progress: (0, 0),
+            auto_live: String::new(),
+            compacting: false,
+            compact_live: String::new(),
+            compact_error: None,
+            fill_generating: false,
+            fill_error: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            tx,
+            rx,
+        }
+    }
+
+    pub fn next_pid(&mut self) -> u64 {
+        let p = self.next_proposal_id;
+        self.next_proposal_id += 1;
+        p
+    }
+
+    pub fn busy(&self) -> bool {
+        self.generating || self.auto_running || self.compacting || self.fill_generating
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ProbeState {
+    Idle,
+    Running,
+    Ok(Vec<String>),
+    Err(String),
+}
+
+#[derive(Debug)]
+pub enum SettingsEvent {
+    ProbeOk(Vec<String>),
+    ProbeErr(String),
+}
+
+pub struct LlmSettingsState {
+    pub probe: ProbeState,
+    pub tx: mpsc::Sender<SettingsEvent>,
+    pub rx: mpsc::Receiver<SettingsEvent>,
+}
+
+impl LlmSettingsState {
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            probe: ProbeState::Idle,
+            tx,
+            rx,
+        }
+    }
 }
 
 pub struct AppState {
@@ -46,10 +180,15 @@ pub struct AppState {
     pub tab: Tab,
     pub selection: Selection,
     pub status: Option<String>,
+
+    pub rt: tokio::runtime::Handle,
+    pub egui_ctx: egui::Context,
+    pub editors: HashMap<Ulid, StoryEditorState>,
+    pub settings: LlmSettingsState,
 }
 
 impl AppState {
-    pub fn load_from_disk() -> Self {
+    pub fn new(rt: tokio::runtime::Handle, egui_ctx: egui::Context) -> Self {
         let config = AppConfig::load().unwrap_or_default();
         let library = config.data_dir.clone().map(Library::new);
         let mut state = Self {
@@ -61,6 +200,10 @@ impl AppState {
             tab: Tab::default(),
             selection: Selection::None,
             status: None,
+            rt,
+            egui_ctx,
+            editors: HashMap::new(),
+            settings: LlmSettingsState::new(),
         };
         if let Err(e) = state.reload_all() {
             state.status = Some(format!("初期読み込みに失敗: {e}"));
@@ -77,7 +220,9 @@ impl AppState {
     }
 
     pub fn reload_all(&mut self) -> Result<()> {
-        let Some(lib) = &self.library else { return Ok(()); };
+        let Some(lib) = &self.library else {
+            return Ok(());
+        };
         self.ideas = lib.load_ideas()?;
         self.categories = lib.load_categories()?;
         self.stories = lib.load_stories()?;
@@ -153,6 +298,30 @@ impl AppState {
             let story = self.stories.remove(pos);
             story.delete()?;
         }
+        self.editors.remove(&id);
         Ok(())
+    }
+
+    pub fn save_idea_now(&mut self, id: Ulid) {
+        if let Some(idea) = self.idea_mut(id) {
+            idea.meta.updated_at = chrono::Utc::now();
+            if let Err(e) = idea.save() {
+                tracing::error!(?e, "save idea");
+            }
+        }
+    }
+    pub fn save_category_now(&mut self, id: Ulid) {
+        if let Some(c) = self.category_mut(id) {
+            if let Err(e) = c.save() {
+                tracing::error!(?e, "save category");
+            }
+        }
+    }
+    pub fn save_story_now(&mut self, id: Ulid) {
+        if let Some(s) = self.story_mut(id) {
+            if let Err(e) = s.save() {
+                tracing::error!(?e, "save story");
+            }
+        }
     }
 }
