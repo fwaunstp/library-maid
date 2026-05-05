@@ -1,730 +1,1361 @@
-use super::state::{AppState, Selection};
-use crate::data::frontmatter::FrontmatterDoc;
-use crate::data::story::Language;
-use crate::llm::{LlmClient, resolve_active_ideas, visible_text};
-use chrono::Utc;
-use dioxus::prelude::*;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use super::state::{
+    AppState, FillProposal, Proposal, Selection, StoryEditorState, StoryEvent,
+};
+use super::theme;
+use crate::llm::{
+    LlmClient, apply_fills, extract_fills, parse_numbered_blocks, resolve_active_ideas,
+    strip_author_notes, visible_text,
+};
+use std::sync::atomic::Ordering;
 use ulid::Ulid;
 
-fn save_idea(mut state: Signal<AppState>, id: Ulid) {
-    if let Some(idea) = state.write().idea_mut(id) {
-        idea.meta.updated_at = Utc::now();
-        if let Err(e) = idea.save() {
-            tracing::error!(?e, "save idea");
+pub fn idea_editor(state: &mut AppState, ui: &mut egui::Ui, id: Ulid) {
+    if state.idea(id).is_none() {
+        ui.label("アイデアが見つかりません");
+        return;
+    }
+
+    let mut delete_requested = false;
+    let mut title_changed = false;
+    let mut body_changed = false;
+    let mut commit = false;
+
+    // Header row
+    ui.horizontal(|ui| {
+        ui.label("タイトル");
+        let idea = state.idea_mut(id).unwrap();
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut idea.meta.title)
+                .desired_width(f32::INFINITY)
+                .min_size(egui::vec2(0.0, 24.0)),
+        );
+        if resp.changed() {
+            title_changed = true;
         }
+        if resp.lost_focus() {
+            commit = true;
+        }
+        if theme::danger_button(ui, "削除").clicked() {
+            delete_requested = true;
+        }
+    });
+
+    if delete_requested {
+        let _ = state.delete_idea(id);
+        state.selection = Selection::None;
+        return;
+    }
+
+    // Categories chips
+    let all_categories: Vec<(Ulid, String)> = state
+        .categories
+        .iter()
+        .map(|c| (c.meta.id, c.meta.name.clone()))
+        .collect();
+    let cats_selected: std::collections::HashSet<Ulid> = state
+        .idea(id)
+        .map(|i| i.meta.categories.iter().copied().collect())
+        .unwrap_or_default();
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("カテゴリ");
+        if all_categories.is_empty() {
+            ui.label(egui::RichText::new("カテゴリ未作成").color(theme::SUBTLE_TEXT));
+        }
+        for (cid, name) in &all_categories {
+            let on = cats_selected.contains(cid);
+            let chip = chip_button(ui, &name, on, false);
+            if chip.clicked() {
+                if let Some(i) = state.idea_mut(id) {
+                    if i.meta.categories.contains(cid) {
+                        i.meta.categories.retain(|x| x != cid);
+                    } else {
+                        i.meta.categories.push(*cid);
+                    }
+                }
+                commit = true;
+            }
+        }
+    });
+
+    // requires (other ideas)
+    let all_ideas: Vec<(Ulid, String)> = state
+        .ideas
+        .iter()
+        .filter(|i| i.meta.id != id)
+        .map(|i| (i.meta.id, i.meta.title.clone()))
+        .collect();
+    let req_selected: std::collections::HashSet<Ulid> = state
+        .idea(id)
+        .map(|i| i.meta.requires.iter().copied().collect())
+        .unwrap_or_default();
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("依存");
+        if all_ideas.is_empty() {
+            ui.label(egui::RichText::new("他のアイデアなし").color(theme::SUBTLE_TEXT));
+        }
+        for (iid, ititle) in &all_ideas {
+            let on = req_selected.contains(iid);
+            let chip = chip_button(ui, &ititle, on, false);
+            if chip.clicked() {
+                if let Some(i) = state.idea_mut(id) {
+                    if i.meta.requires.contains(iid) {
+                        i.meta.requires.retain(|x| x != iid);
+                    } else {
+                        i.meta.requires.push(*iid);
+                    }
+                }
+                commit = true;
+            }
+        }
+    });
+
+    ui.separator();
+
+    {
+        let idea = state.idea_mut(id).unwrap();
+        let resp = ui.add(
+            egui::TextEdit::multiline(&mut idea.body)
+                .desired_width(f32::INFINITY)
+                .desired_rows(20),
+        );
+        if resp.changed() {
+            body_changed = true;
+        }
+        if resp.lost_focus() {
+            commit = true;
+        }
+    }
+
+    let _ = title_changed;
+    let _ = body_changed;
+    if commit {
+        state.save_idea_now(id);
     }
 }
 
-fn save_category(mut state: Signal<AppState>, id: Ulid) {
-    if let Some(c) = state.write().category_mut(id) {
-        if let Err(e) = c.save() {
-            tracing::error!(?e, "save category");
+pub fn category_editor(state: &mut AppState, ui: &mut egui::Ui, id: Ulid) {
+    if state.category(id).is_none() {
+        ui.label("カテゴリが見つかりません");
+        return;
+    }
+
+    let mut delete_requested = false;
+    let mut commit = false;
+
+    ui.horizontal(|ui| {
+        ui.label("名前");
+        let c = state.category_mut(id).unwrap();
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut c.meta.name)
+                .desired_width(f32::INFINITY)
+                .min_size(egui::vec2(0.0, 24.0)),
+        );
+        if resp.lost_focus() {
+            commit = true;
         }
+        if theme::danger_button(ui, "削除").clicked() {
+            delete_requested = true;
+        }
+    });
+
+    if delete_requested {
+        let _ = state.delete_category(id);
+        state.selection = Selection::None;
+        return;
+    }
+
+    ui.separator();
+    {
+        let c = state.category_mut(id).unwrap();
+        let resp = ui.add(
+            egui::TextEdit::multiline(&mut c.body)
+                .desired_width(f32::INFINITY)
+                .desired_rows(20),
+        );
+        if resp.lost_focus() {
+            commit = true;
+        }
+    }
+
+    if commit {
+        state.save_category_now(id);
     }
 }
 
-fn save_story(mut state: Signal<AppState>, id: Ulid) {
-    if let Some(s) = state.write().story_mut(id) {
-        if let Err(e) = s.save() {
-            tracing::error!(?e, "save story");
-        }
-    }
-}
-
-#[component]
-pub fn IdeaEditor(id: Ulid) -> Element {
-    let mut state = use_context::<Signal<AppState>>();
-
-    let (title, body, categories_selected, requires_selected, all_categories, all_ideas) = {
-        let s = state.read();
-        let Some(idea) = s.idea(id) else {
-            return rsx! { div { class: "empty", "アイデアが見つかりません" } };
-        };
+fn chip_button(ui: &mut egui::Ui, label: &str, on: bool, auto: bool) -> egui::Response {
+    let (fill, text_color) = if auto {
         (
-            idea.meta.title.clone(),
-            idea.body.clone(),
-            idea.meta.categories.clone(),
-            idea.meta.requires.clone(),
-            s.categories.iter().map(|c| (c.meta.id, c.meta.name.clone())).collect::<Vec<_>>(),
-            s.ideas.iter()
-                .filter(|i| i.meta.id != id)
-                .map(|i| (i.meta.id, i.meta.title.clone()))
-                .collect::<Vec<_>>(),
+            theme::AUTO_GREEN,
+            egui::Color32::from_rgb(0xb9, 0xe8, 0xc8),
+        )
+    } else if on {
+        (theme::ACCENT, egui::Color32::WHITE)
+    } else {
+        (
+            egui::Color32::from_rgb(0x2a, 0x2d, 0x33),
+            egui::Color32::from_rgb(0xd0, 0xd4, 0xdc),
+        )
+    };
+    let btn = egui::Button::new(egui::RichText::new(label).color(text_color))
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(12));
+    let mut resp = ui.add(btn);
+    if auto {
+        resp = resp.on_hover_text("依存により自動有効");
+    }
+    resp
+}
+
+// =============================================================================
+// Story editor
+// =============================================================================
+
+pub fn story_editor(state: &mut AppState, ui: &mut egui::Ui, id: Ulid) {
+    if state.story(id).is_none() {
+        ui.label("ストーリーが見つかりません");
+        return;
+    }
+
+    state
+        .editors
+        .entry(id)
+        .or_insert_with(StoryEditorState::new);
+
+    // ----- meta row -----
+    let mut delete_requested = false;
+    let mut commit_story = false;
+
+    ui.horizontal(|ui| {
+        let s = state.story_mut(id).unwrap();
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut s.meta.title)
+                .hint_text("タイトル")
+                .min_size(egui::vec2(280.0, 24.0)),
+        );
+        if resp.lost_focus() {
+            commit_story = true;
+        }
+
+        if ui.checkbox(&mut s.meta.nsfw, "NSFW").changed() {
+            commit_story = true;
+        }
+
+        let mut disable_thinking = state.config.llm.disable_thinking;
+        let resp = ui
+            .checkbox(&mut disable_thinking, "Thinking 無効")
+            .on_hover_text("reasoning_effort=none を送信。Qwen3 等で思考トークンを抑止");
+        if resp.changed() {
+            state.config.llm.disable_thinking = disable_thinking;
+            if let Err(e) = state.save_config() {
+                tracing::error!(?e, "save config");
+            }
+        }
+
+        if theme::danger_button(ui, "削除").clicked() {
+            delete_requested = true;
+        }
+    });
+
+    if delete_requested {
+        let _ = state.delete_story(id);
+        state.selection = Selection::None;
+        return;
+    }
+    if commit_story {
+        state.save_story_now(id);
+    }
+
+    // ----- active idea chips -----
+    let chips: Vec<(Ulid, String, bool, bool)> = {
+        let s = state.story(id).unwrap();
+        let auto = resolve_active_ideas(&state.ideas, &s.meta.active_ideas);
+        let auto_ids: std::collections::HashSet<Ulid> =
+            auto.iter().map(|i| i.meta.id).collect();
+        let manual: std::collections::HashSet<Ulid> =
+            s.meta.active_ideas.iter().copied().collect();
+        state
+            .ideas
+            .iter()
+            .map(|i| {
+                let on = manual.contains(&i.meta.id);
+                let auto_only = auto_ids.contains(&i.meta.id) && !on;
+                (i.meta.id, i.meta.title.clone(), on, auto_only)
+            })
+            .collect()
+    };
+
+    let mut chip_toggle: Option<Ulid> = None;
+    egui::ScrollArea::vertical()
+        .id_salt("idea_chips_scroll")
+        .max_height(96.0)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (iid, ititle, on, auto_only) in &chips {
+                    let r = chip_button(ui, ititle, *on, *auto_only);
+                    if r.clicked() && !*auto_only {
+                        chip_toggle = Some(*iid);
+                    }
+                }
+            });
+        });
+    if let Some(iid) = chip_toggle {
+        if let Some(s) = state.story_mut(id) {
+            if let Some(pos) = s.meta.active_ideas.iter().position(|x| *x == iid) {
+                s.meta.active_ideas.remove(pos);
+            } else {
+                s.meta.active_ideas.push(iid);
+            }
+        }
+        state.save_story_now(id);
+    }
+
+    ui.separator();
+
+    // Body (fixed rows; outer ScrollArea in library.rs handles overflow).
+    {
+        let s = state.story_mut(id).unwrap();
+        let resp = ui.add(
+            egui::TextEdit::multiline(&mut s.body)
+                .desired_width(f32::INFINITY)
+                .desired_rows(18)
+                .font(egui::TextStyle::Monospace),
+        );
+        if resp.lost_focus() {
+            state.save_story_now(id);
+        }
+    }
+
+    ui.separator();
+
+    // Generation panel — flows below; the outer ScrollArea scrolls when the
+    // window is too short to fit body + proposals together.
+    gen_panel(state, ui, id);
+}
+
+fn gen_panel(state: &mut AppState, ui: &mut egui::Ui, id: Ulid) {
+    // Snapshot busy flags before borrowing editor mutably for actions.
+    let (busy_general, busy_fill, count_now) = {
+        let ed = state.editors.get(&id).unwrap();
+        (
+            ed.generating || ed.auto_running || ed.compacting,
+            ed.fill_generating,
+            ed.count,
         )
     };
 
-    rsx! {
-        div { class: "row",
-            label { "タイトル" }
-            input { r#type: "text", initial_value: "{title}",
-                oninput: move |e| {
-                    let v = e.value();
-                    if let Some(i) = state.write().idea_mut(id) { i.meta.title = v; }
-                },
-                onblur: move |_| save_idea(state, id),
-            }
-            button { class: "danger",
-                onclick: move |_| {
-                    let _ = state.write().delete_idea(id);
-                    state.write().selection = Selection::None;
-                },
-                "削除"
+    // ----- Controls row -----
+    let mut do_generate = false;
+    let mut do_auto = false;
+    let mut do_compact = false;
+    let mut do_fill = false;
+    let mut do_cancel = false;
+    let mut clear_proposals = false;
+    let mut clear_fill_proposals = false;
+    let mut insert_note = false;
+    let mut insert_fill = false;
+
+    ui.horizontal_wrapped(|ui| {
+        if theme::primary_button_enabled(ui, !busy_general, generate_btn_label(state, id))
+            .on_hover_text("案を N 個生成して提示。採用したものだけ本文に追加")
+            .clicked()
+        {
+            do_generate = true;
+        }
+
+        let auto_label = auto_btn_label(state, id);
+        if ui
+            .add_enabled(!busy_general, egui::Button::new(auto_label))
+            .on_hover_text("N 回連続で生成 → 自動で本文に追加。ボツ案なし")
+            .clicked()
+        {
+            do_auto = true;
+        }
+
+        let compact_label = compact_btn_label(state, id);
+        if ui
+            .add_enabled(!busy_general, egui::Button::new(compact_label))
+            .on_hover_text("本文の前半を要約に置き換えてコンテキスト消費を抑える")
+            .clicked()
+        {
+            do_compact = true;
+        }
+
+        ui.label("回数:");
+        let mut count_val = count_now;
+        if ui
+            .add(egui::DragValue::new(&mut count_val).range(1..=20).speed(0.1))
+            .changed()
+        {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                ed.count = count_val.max(1).min(20);
             }
         }
-        div { class: "row",
-            label { "カテゴリ" }
-            div { class: "tags-input",
-                for (cid, name) in all_categories.iter().cloned() {
-                    {
-                        let on = categories_selected.contains(&cid);
-                        rsx! {
-                            span {
-                                key: "{cid}",
-                                class: "tag",
-                                style: if on { "background: #4a6cf7; color: #fff;" } else { "" },
-                                onclick: move |_| {
-                                    {
-                                        let mut g = state.write();
-                                        if let Some(i) = g.idea_mut(id) {
-                                            if i.meta.categories.contains(&cid) {
-                                                i.meta.categories.retain(|x| *x != cid);
-                                            } else {
-                                                i.meta.categories.push(cid);
-                                            }
-                                        }
-                                    }
-                                    save_idea(state, id);
-                                },
-                                "{name}"
-                            }
-                        }
+
+        let fill_label = fill_btn_label(state, id);
+        if ui
+            .add_enabled(!busy_general && !busy_fill, egui::Button::new(fill_label))
+            .on_hover_text("本文中の <!-- FILL: ... --> 全部を1回のAPIで埋める")
+            .clicked()
+        {
+            do_fill = true;
+        }
+
+        if busy_general || busy_fill {
+            if theme::danger_button(ui, "キャンセル").clicked() {
+                do_cancel = true;
+            }
+        }
+
+        let (proposals_len, fill_len) = {
+            let ed = state.editors.get(&id).unwrap();
+            (ed.proposals.len(), ed.fill_proposals.len())
+        };
+        if proposals_len > 0 {
+            if ui.button("すべて破棄").clicked() {
+                clear_proposals = true;
+            }
+        }
+        if fill_len > 0 {
+            if ui.button("穴埋め案を全破棄").clicked() {
+                clear_fill_proposals = true;
+            }
+        }
+
+        if ui
+            .button("著者注を挿入")
+            .on_hover_text("AIへの指示を本文末尾にHTMLコメントとして挿入")
+            .clicked()
+        {
+            insert_note = true;
+        }
+        if ui
+            .button("FILL を挿入")
+            .on_hover_text("本文末尾にプレースホルダー <!-- FILL: ヒント --> を挿入")
+            .clicked()
+        {
+            insert_fill = true;
+        }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(format!("案: {proposals_len} / 穴埋め案: {fill_len}"))
+                    .small()
+                    .color(theme::SUBTLE_TEXT),
+            );
+        });
+    });
+
+    if do_cancel {
+        if let Some(ed) = state.editors.get(&id) {
+            ed.cancel_flag.store(true, Ordering::SeqCst);
+        }
+    }
+    if clear_proposals {
+        if let Some(ed) = state.editors.get_mut(&id) {
+            ed.proposals.clear();
+        }
+    }
+    if clear_fill_proposals {
+        if let Some(ed) = state.editors.get_mut(&id) {
+            ed.fill_proposals.clear();
+        }
+    }
+    if insert_note {
+        if let Some(s) = state.story_mut(id) {
+            if !s.body.is_empty() && !s.body.ends_with('\n') {
+                s.body.push('\n');
+            }
+            s.body.push_str("<!-- NOTE: ここに指示を書く -->\n");
+        }
+        state.save_story_now(id);
+    }
+    if insert_fill {
+        if let Some(s) = state.story_mut(id) {
+            if !s.body.is_empty() && !s.body.ends_with('\n') {
+                s.body.push('\n');
+            }
+            s.body.push_str("<!-- FILL: ここを埋める -->\n");
+        }
+        state.save_story_now(id);
+    }
+
+    // Triggers that spawn async work.
+    if do_generate {
+        spawn_generate(state, id);
+    }
+    if do_auto {
+        spawn_auto(state, id);
+    }
+    if do_compact {
+        spawn_compact(state, id);
+    }
+    if do_fill {
+        spawn_fill(state, id);
+    }
+
+    // ----- Status / errors / live previews -----
+    let (fill_err, compact_err) = {
+        let ed = state.editors.get(&id).unwrap();
+        (ed.fill_error.clone(), ed.compact_error.clone())
+    };
+    let mut clear_fill_err = false;
+    let mut clear_compact_err = false;
+    if let Some(err) = fill_err {
+        if error_banner(ui, &format!("穴埋め失敗: {err}")) {
+            clear_fill_err = true;
+        }
+    }
+    if let Some(err) = compact_err {
+        if error_banner(ui, &format!("圧縮失敗: {err}")) {
+            clear_compact_err = true;
+        }
+    }
+    if clear_fill_err {
+        if let Some(ed) = state.editors.get_mut(&id) {
+            ed.fill_error = None;
+        }
+    }
+    if clear_compact_err {
+        if let Some(ed) = state.editors.get_mut(&id) {
+            ed.compact_error = None;
+        }
+    }
+
+    // compact live preview
+    {
+        let (compacting, live) = {
+            let ed = state.editors.get(&id).unwrap();
+            (ed.compacting, ed.compact_live.clone())
+        };
+        if compacting {
+            let (visible, in_think) = visible_text(&live);
+            let visible = visible.trim_start().to_string();
+            proposal_card_pending(
+                ui,
+                "圧縮中: 前半を要約に置換します",
+                &visible,
+                in_think,
+                "要約開始待ち…",
+            );
+        }
+    }
+
+    // auto live preview
+    {
+        let (running, live) = {
+            let ed = state.editors.get(&id).unwrap();
+            (ed.auto_running, ed.auto_live.clone())
+        };
+        if running {
+            let (visible, in_think) = visible_text(&live);
+            let visible = visible.trim_start().to_string();
+            proposal_card_pending(ui, "", &visible, in_think, "生成開始待ち…");
+        }
+    }
+
+    // proposals
+    let proposals = state.editors.get(&id).map(|e| e.proposals.clone()).unwrap_or_default();
+    for prop in &proposals {
+        proposal_card(state, ui, id, prop);
+    }
+
+    // fill proposals
+    let fills = state.editors.get(&id).map(|e| e.fill_proposals.clone()).unwrap_or_default();
+    for prop in &fills {
+        fill_proposal_card(state, ui, id, prop);
+    }
+}
+
+fn generate_btn_label(state: &AppState, id: Ulid) -> String {
+    let ed = state.editors.get(&id).unwrap();
+    if ed.generating {
+        "生成中…".into()
+    } else {
+        "続きを生成 (案出し)".into()
+    }
+}
+
+fn auto_btn_label(state: &AppState, id: Ulid) -> String {
+    let ed = state.editors.get(&id).unwrap();
+    if ed.auto_running {
+        let (done, total) = ed.auto_progress;
+        format!("自動連投中… {done}/{total}")
+    } else {
+        "自動連投".into()
+    }
+}
+
+fn compact_btn_label(state: &AppState, id: Ulid) -> String {
+    let ed = state.editors.get(&id).unwrap();
+    if ed.compacting { "圧縮中…".into() } else { "圧縮".into() }
+}
+
+fn fill_btn_label(state: &AppState, id: Ulid) -> String {
+    let ed = state.editors.get(&id).unwrap();
+    if ed.fill_generating {
+        "穴埋め中…".into()
+    } else {
+        "穴埋め生成".into()
+    }
+}
+
+fn error_banner(ui: &mut egui::Ui, msg: &str) -> bool {
+    let mut closed = false;
+    egui::Frame::default()
+        .fill(egui::Color32::from_rgb(0x3a, 0x1f, 0x22))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0x6b, 0x30, 0x30)))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(msg).color(theme::ERROR_TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("閉じる").clicked() {
+                        closed = true;
                     }
-                }
-                if all_categories.is_empty() {
-                    span { class: "sub", "カテゴリ未作成" }
-                }
+                });
+            });
+        });
+    closed
+}
+
+fn proposal_card_pending(
+    ui: &mut egui::Ui,
+    header: &str,
+    visible: &str,
+    in_think: bool,
+    placeholder_when_empty: &str,
+) {
+    egui::Frame::default()
+        .fill(egui::Color32::from_rgb(0x1f, 0x22, 0x28))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0x2a, 0x2d, 0x33)))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            if !header.is_empty() {
+                ui.label(
+                    egui::RichText::new(header).small().color(theme::SUBTLE_TEXT),
+                );
             }
-        }
-        div { class: "row",
-            label { "依存 (requires)" }
-            div { class: "tags-input",
-                for (iid, ititle) in all_ideas.iter().cloned() {
-                    {
-                        let on = requires_selected.contains(&iid);
-                        rsx! {
-                            span {
-                                key: "{iid}",
-                                class: "tag",
-                                style: if on { "background: #4a6cf7; color: #fff;" } else { "" },
-                                onclick: move |_| {
-                                    {
-                                        let mut g = state.write();
-                                        if let Some(i) = g.idea_mut(id) {
-                                            if i.meta.requires.contains(&iid) {
-                                                i.meta.requires.retain(|x| *x != iid);
-                                            } else {
-                                                i.meta.requires.push(iid);
-                                            }
-                                        }
-                                    }
-                                    save_idea(state, id);
-                                },
-                                "{ititle}"
-                            }
-                        }
+            if visible.is_empty() {
+                ui.label(
+                    egui::RichText::new(if in_think { "考え中…" } else { placeholder_when_empty })
+                        .color(theme::SUBTLE_TEXT),
+                );
+            } else {
+                ui.label(visible);
+                ui.label(
+                    egui::RichText::new(if in_think { " 〔思考中〕" } else { " ▍" })
+                        .color(theme::SUBTLE_TEXT),
+                );
+            }
+        });
+}
+
+fn proposal_card(state: &mut AppState, ui: &mut egui::Ui, id: Ulid, prop: &Proposal) {
+    let pid = prop.id;
+    let (visible, in_think) = visible_text(&prop.raw);
+    let visible = strip_author_notes(&visible).trim_start().to_string();
+    let mut adopt = false;
+    let mut discard = false;
+
+    egui::Frame::default()
+        .fill(egui::Color32::from_rgb(0x1f, 0x22, 0x28))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0x2a, 0x2d, 0x33)))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            if let Some(err) = prop.error.clone() {
+                ui.label(egui::RichText::new(format!("エラー: {err}")).color(theme::ERROR_TEXT));
+                ui.horizontal(|ui| {
+                    if ui.button("閉じる").clicked() {
+                        discard = true;
                     }
-                }
-                if all_ideas.is_empty() {
-                    span { class: "sub", "他のアイデアなし" }
+                });
+                return;
+            }
+
+            if visible.is_empty() && prop.pending {
+                ui.label(
+                    egui::RichText::new(if in_think { "考え中…" } else { "生成開始待ち…" })
+                        .color(theme::SUBTLE_TEXT),
+                );
+            } else {
+                ui.label(&visible);
+                if prop.pending {
+                    ui.label(
+                        egui::RichText::new(if in_think { " 〔思考中〕" } else { " ▍" })
+                            .color(theme::SUBTLE_TEXT),
+                    );
                 }
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::primary_button_enabled(ui, !prop.pending && !visible.is_empty(), "採用")
+                    .clicked()
+                {
+                    adopt = true;
+                }
+                if ui.add_enabled(!prop.pending, egui::Button::new("破棄")).clicked() {
+                    discard = true;
+                }
+            });
+        });
+
+    if adopt {
+        if let Some(s) = state.story_mut(id) {
+            s.append_body(&visible);
         }
-        textarea {
-            style: "flex: 1; min-height: 300px;",
-            initial_value: "{body}",
-            oninput: move |e| {
-                let v = e.value();
-                if let Some(i) = state.write().idea_mut(id) { i.body = v; }
-            },
-            onblur: move |_| save_idea(state, id),
+        state.save_story_now(id);
+        if let Some(ed) = state.editors.get_mut(&id) {
+            ed.proposals.retain(|p| p.id != pid);
+        }
+    } else if discard {
+        if let Some(ed) = state.editors.get_mut(&id) {
+            ed.proposals.retain(|p| p.id != pid);
         }
     }
 }
 
-#[component]
-pub fn CategoryEditor(id: Ulid) -> Element {
-    let mut state = use_context::<Signal<AppState>>();
-    let (name, body) = {
-        let s = state.read();
-        let Some(c) = s.category(id) else {
-            return rsx! { div { class: "empty", "カテゴリが見つかりません" } };
-        };
-        (c.meta.name.clone(), c.body.clone())
+fn fill_proposal_card(
+    state: &mut AppState,
+    ui: &mut egui::Ui,
+    id: Ulid,
+    prop: &FillProposal,
+) {
+    let pid = prop.id;
+    let (visible, in_think) = visible_text(&prop.raw);
+    let parsed = if prop.pending {
+        Default::default()
+    } else {
+        parse_numbered_blocks(&visible)
     };
-    rsx! {
-        div { class: "row",
-            label { "名前" }
-            input { r#type: "text", initial_value: "{name}",
-                oninput: move |e| {
-                    let v = e.value();
-                    if let Some(c) = state.write().category_mut(id) { c.meta.name = v; }
-                },
-                onblur: move |_| save_category(state, id),
+    let mut adopt = false;
+    let mut discard = false;
+
+    egui::Frame::default()
+        .fill(egui::Color32::from_rgb(0x1f, 0x22, 0x28))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0x2a, 0x2d, 0x33)))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("穴埋め案: {} スロット", prop.hints.len()))
+                    .small()
+                    .color(theme::SUBTLE_TEXT),
+            );
+            if let Some(err) = prop.error.clone() {
+                ui.label(egui::RichText::new(format!("エラー: {err}")).color(theme::ERROR_TEXT));
+                if ui.button("閉じる").clicked() {
+                    discard = true;
+                }
+                return;
             }
-            button { class: "danger",
-                onclick: move |_| {
-                    let _ = state.write().delete_category(id);
-                    state.write().selection = Selection::None;
-                },
-                "削除"
+            if prop.pending {
+                if visible.trim().is_empty() {
+                    ui.label(
+                        egui::RichText::new(if in_think { "考え中…" } else { "生成開始待ち…" })
+                            .color(theme::SUBTLE_TEXT),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "ストリーミング中… ({} 文字受信)",
+                            visible.len()
+                        ))
+                        .color(theme::SUBTLE_TEXT),
+                    );
+                }
+            } else {
+                for (i, hint) in prop.hints.iter().enumerate() {
+                    let n = i + 1;
+                    let filled = parsed.get(&n).cloned().unwrap_or_default();
+                    let label = if hint.is_empty() {
+                        format!("#{n}")
+                    } else {
+                        format!("#{n}: {hint}")
+                    };
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(label)
+                            .small()
+                            .color(theme::SUBTLE_TEXT),
+                    );
+                    if filled.trim().is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "(モデルが #{n} を返さなかった — 採用すると元の FILL マーカーが残ります)"
+                            ))
+                            .small()
+                            .color(theme::ERROR_TEXT),
+                        );
+                    } else {
+                        ui.label(filled);
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::primary_button_enabled(ui, !parsed.is_empty(), "採用").clicked() {
+                        adopt = true;
+                    }
+                    if ui.button("破棄").clicked() {
+                        discard = true;
+                    }
+                });
             }
+        });
+
+    if adopt {
+        if let Some(s) = state.story_mut(id) {
+            let slots = extract_fills(&s.body);
+            let new = apply_fills(&s.body, &slots, &parsed);
+            s.replace_body(new);
         }
-        textarea {
-            style: "flex: 1; min-height: 300px;",
-            initial_value: "{body}",
-            oninput: move |e| {
-                let v = e.value();
-                if let Some(c) = state.write().category_mut(id) { c.body = v; }
-            },
-            onblur: move |_| save_category(state, id),
+        state.save_story_now(id);
+        if let Some(ed) = state.editors.get_mut(&id) {
+            ed.fill_proposals.retain(|p| p.id != pid);
+        }
+    } else if discard {
+        if let Some(ed) = state.editors.get_mut(&id) {
+            ed.fill_proposals.retain(|p| p.id != pid);
         }
     }
 }
 
-const STORY_BODY_DOM_ID: &str = "lm-story-body";
+// =============================================================================
+// Async spawn helpers
+// =============================================================================
 
-fn push_body_to_dom(text: &str) {
-    let json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
-    let js = format!(
-        "(()=>{{const ta=document.getElementById('{STORY_BODY_DOM_ID}');if(!ta)return;ta.value={json};ta.scrollTop=ta.scrollHeight;ta.selectionStart=ta.selectionEnd=ta.value.length;}})();"
-    );
-    let _ = dioxus::document::eval(&js);
-}
-
-#[derive(Debug, Clone)]
-struct Proposal {
-    id: u64,
-    raw: String,
-    pending: bool,
-    error: Option<String>,
-}
-
-fn find_idx(props: &[Proposal], id: u64) -> Option<usize> {
-    props.iter().position(|p| p.id == id)
-}
-
-#[component]
-pub fn StoryEditor(id: Ulid) -> Element {
-    let mut state = use_context::<Signal<AppState>>();
-    let mut count = use_signal(|| 3u32);
-    let mut proposals = use_signal::<Vec<Proposal>>(Vec::new);
-    let mut next_proposal_id = use_signal(|| 1u64);
-    let cancel_flag = use_hook(|| Arc::new(AtomicBool::new(false)));
-    let mut generating = use_signal(|| false);
-    let mut auto_running = use_signal(|| false);
-    let mut auto_progress = use_signal(|| (0u32, 0u32));
-    let mut auto_live = use_signal(String::new);
-    let mut compacting = use_signal(|| false);
-    let mut compact_live = use_signal(String::new);
-    let mut compact_error = use_signal::<Option<String>>(|| None);
-
-    let disable_thinking = state.read().llm().disable_thinking;
-    let (title, body, language, nsfw, all_ideas_with_status) = {
-        let s = state.read();
-        let Some(story) = s.story(id) else {
-            return rsx! { div { class: "empty", "ストーリーが見つかりません" } };
+fn spawn_generate(state: &mut AppState, id: Ulid) {
+    let count;
+    let placeholder_pid;
+    let cancel;
+    let tx;
+    {
+        let ed = match state.editors.get_mut(&id) {
+            Some(e) => e,
+            None => return,
         };
-        let auto = resolve_active_ideas(&s.ideas, &story.meta.active_ideas);
-        let auto_ids: std::collections::HashSet<Ulid> = auto.iter().map(|i| i.meta.id).collect();
-        let manual: std::collections::HashSet<Ulid> = story.meta.active_ideas.iter().copied().collect();
-        let chips: Vec<(Ulid, String, bool, bool)> = s.ideas.iter().map(|i| {
-            let on = manual.contains(&i.meta.id);
-            let auto_only = auto_ids.contains(&i.meta.id) && !on;
-            (i.meta.id, i.meta.title.clone(), on, auto_only)
-        }).collect();
-        (
-            story.meta.title.clone(),
-            story.body.clone(),
-            story.meta.language,
-            story.meta.nsfw,
-            chips,
-        )
+        if ed.count == 0 || ed.generating {
+            return;
+        }
+        ed.cancel_flag.store(false, Ordering::SeqCst);
+        ed.generating = true;
+        count = ed.count;
+        placeholder_pid = ed.next_pid();
+        cancel = ed.cancel_flag.clone();
+        tx = ed.tx.clone();
+        ed.proposals.push(Proposal {
+            id: placeholder_pid,
+            raw: String::new(),
+            pending: true,
+            error: None,
+        });
+    }
+    let snapshot_story = match state.story(id) {
+        Some(s) => s.clone(),
+        None => return,
     };
-
-    let llm_cfg = state.read().llm().clone();
+    let snapshot_ideas = state.ideas.clone();
+    let llm_cfg = state.config.llm.clone();
     let prompts_dir = state
-        .read()
         .library
         .as_ref()
         .map(|l| l.prompts_dir())
         .unwrap_or_default();
+    let ctx = state.egui_ctx.clone();
 
-    let on_generate = {
-        let cancel_flag = cancel_flag.clone();
-        let llm_cfg = llm_cfg.clone();
-        let prompts_dir = prompts_dir.clone();
-        move |_| {
-            let n = *count.read();
-            if n == 0 || *generating.read() { return; }
-            cancel_flag.store(false, Ordering::SeqCst);
-            generating.set(true);
+    state.rt.spawn(async move {
+        tracing::info!(count, "stream_proposals: spawn start");
+        let client = LlmClient::new(llm_cfg);
+        let tx2 = tx.clone();
+        let ctx2 = ctx.clone();
+        let on_delta = move |chunk: &str| {
+            let _ = tx2.send(StoryEvent::ProposalDelta {
+                pid: placeholder_pid,
+                chunk: chunk.to_string(),
+            });
+            ctx2.request_repaint();
+        };
+        let result = client
+            .stream_proposals(
+                &prompts_dir,
+                &snapshot_story,
+                &snapshot_ideas,
+                count,
+                cancel.clone(),
+                on_delta,
+            )
+            .await;
+        tracing::info!(ok = result.is_ok(), "stream_proposals: finished");
+        if cancel.load(Ordering::SeqCst) {
+            let _ = tx.send(StoryEvent::ProposalsCancelled { placeholder_pid });
+        } else {
+            match result {
+                Ok(raw) => {
+                    let _ = tx.send(StoryEvent::ProposalsDone {
+                        placeholder_pid,
+                        raw,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(StoryEvent::ProposalsError {
+                        placeholder_pid,
+                        error: format!("{e}"),
+                    });
+                }
+            }
+        }
+        ctx.request_repaint();
+    });
+}
 
-            let snapshot_story = state.read().story(id).cloned();
-            let snapshot_ideas = state.read().ideas.clone();
-            let llm_cfg = llm_cfg.clone();
-            let prompts_dir = prompts_dir.clone();
-            let cancel_flag = cancel_flag.clone();
+fn spawn_auto(state: &mut AppState, id: Ulid) {
+    let count;
+    let cancel;
+    let tx;
+    {
+        let ed = match state.editors.get_mut(&id) {
+            Some(e) => e,
+            None => return,
+        };
+        if ed.count == 0 || ed.auto_running || ed.generating {
+            return;
+        }
+        ed.cancel_flag.store(false, Ordering::SeqCst);
+        ed.auto_running = true;
+        ed.auto_progress = (0, ed.count);
+        ed.auto_live.clear();
+        count = ed.count;
+        cancel = ed.cancel_flag.clone();
+        tx = ed.tx.clone();
+    }
+    let snapshot_story = match state.story(id) {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let snapshot_ideas = state.ideas.clone();
+    let llm_cfg = state.config.llm.clone();
+    let prompts_dir = state
+        .library
+        .as_ref()
+        .map(|l| l.prompts_dir())
+        .unwrap_or_default();
+    let ctx = state.egui_ctx.clone();
 
-            spawn(async move {
-                let Some(story) = snapshot_story else { generating.set(false); return; };
-                let client = LlmClient::new(llm_cfg);
-                for _ in 0..n {
-                    if cancel_flag.load(Ordering::SeqCst) { break; }
-                    let pid = {
-                        let id = *next_proposal_id.read();
-                        next_proposal_id.set(id + 1);
-                        id
-                    };
-                    proposals.write().push(Proposal {
+    state.rt.spawn(async move {
+        let client = LlmClient::new(llm_cfg);
+        let tx2 = tx.clone();
+        let ctx2 = ctx.clone();
+        let on_delta = move |chunk: &str| {
+            let _ = tx2.send(StoryEvent::AutoDelta {
+                chunk: chunk.to_string(),
+            });
+            ctx2.request_repaint();
+        };
+        let result = client
+            .stream_auto_batch(
+                &prompts_dir,
+                &snapshot_story,
+                &snapshot_ideas,
+                count,
+                cancel.clone(),
+                on_delta,
+            )
+            .await;
+        let cancelled = cancel.load(Ordering::SeqCst);
+        match result {
+            Ok(raw) => {
+                let _ = tx.send(StoryEvent::AutoDone { raw, cancelled });
+            }
+            Err(e) => {
+                let _ = tx.send(StoryEvent::AutoError {
+                    error: format!("{e:#}"),
+                });
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+fn spawn_compact(state: &mut AppState, id: Ulid) {
+    let cancel;
+    let tx;
+    {
+        let ed = match state.editors.get_mut(&id) {
+            Some(e) => e,
+            None => return,
+        };
+        if ed.compacting || ed.generating || ed.auto_running {
+            return;
+        }
+        ed.cancel_flag.store(false, Ordering::SeqCst);
+        ed.compacting = true;
+        ed.compact_error = None;
+        ed.compact_live.clear();
+        cancel = ed.cancel_flag.clone();
+        tx = ed.tx.clone();
+    }
+    let snapshot_story = match state.story(id) {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let snapshot_ideas = state.ideas.clone();
+    let llm_cfg = state.config.llm.clone();
+    let prompts_dir = state
+        .library
+        .as_ref()
+        .map(|l| l.prompts_dir())
+        .unwrap_or_default();
+    let ctx = state.egui_ctx.clone();
+
+    state.rt.spawn(async move {
+        let client = LlmClient::new(llm_cfg);
+        let tx2 = tx.clone();
+        let ctx2 = ctx.clone();
+        let on_delta = move |chunk: &str| {
+            let _ = tx2.send(StoryEvent::CompactDelta {
+                chunk: chunk.to_string(),
+            });
+            ctx2.request_repaint();
+        };
+        let result = client
+            .compact_body(
+                &prompts_dir,
+                &snapshot_story,
+                &snapshot_ideas,
+                cancel.clone(),
+                on_delta,
+            )
+            .await;
+        match result {
+            Ok(new_body) => {
+                let _ = tx.send(StoryEvent::CompactDone { new_body });
+            }
+            Err(e) => {
+                let _ = tx.send(StoryEvent::CompactError {
+                    error: format!("{e:#}"),
+                });
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+fn spawn_fill(state: &mut AppState, id: Ulid) {
+    let count;
+    let cancel;
+    let tx;
+    let snapshot_story = match state.story(id) {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let slots = extract_fills(&snapshot_story.body);
+    if slots.is_empty() {
+        if let Some(ed) = state.editors.get_mut(&id) {
+            ed.fill_error = Some(
+                "本文に <!-- FILL: ... --> がありません。「FILL を挿入」で穴を作ってください。"
+                    .to_string(),
+            );
+        }
+        return;
+    }
+
+    {
+        let ed = match state.editors.get_mut(&id) {
+            Some(e) => e,
+            None => return,
+        };
+        if ed.count == 0 || ed.busy() {
+            return;
+        }
+        ed.cancel_flag.store(false, Ordering::SeqCst);
+        ed.fill_generating = true;
+        ed.fill_error = None;
+        count = ed.count;
+        cancel = ed.cancel_flag.clone();
+        tx = ed.tx.clone();
+    }
+
+    let snapshot_ideas = state.ideas.clone();
+    let llm_cfg = state.config.llm.clone();
+    let prompts_dir = state
+        .library
+        .as_ref()
+        .map(|l| l.prompts_dir())
+        .unwrap_or_default();
+    let ctx = state.egui_ctx.clone();
+    let hints: Vec<String> = slots.iter().map(|s| s.hint.clone()).collect();
+
+    // Allocate placeholder PIDs up front so they show immediately in the UI.
+    let mut pids = Vec::with_capacity(count as usize);
+    if let Some(ed) = state.editors.get_mut(&id) {
+        for _ in 0..count {
+            let pid = ed.next_pid();
+            pids.push(pid);
+            ed.fill_proposals.push(FillProposal {
+                id: pid,
+                raw: String::new(),
+                pending: true,
+                error: None,
+                hints: hints.clone(),
+            });
+        }
+    }
+
+    state.rt.spawn(async move {
+        let client = LlmClient::new(llm_cfg);
+        for pid in pids {
+            if cancel.load(Ordering::SeqCst) {
+                let _ = tx.send(StoryEvent::FillCancelled { pid });
+                continue;
+            }
+            let tx2 = tx.clone();
+            let ctx2 = ctx.clone();
+            let on_delta = move |chunk: &str| {
+                let _ = tx2.send(StoryEvent::FillDelta {
+                    pid,
+                    chunk: chunk.to_string(),
+                });
+                ctx2.request_repaint();
+            };
+            let result = client
+                .stream_fill(
+                    &prompts_dir,
+                    &snapshot_story,
+                    &snapshot_ideas,
+                    &slots,
+                    cancel.clone(),
+                    on_delta,
+                )
+                .await;
+            if cancel.load(Ordering::SeqCst) {
+                let _ = tx.send(StoryEvent::FillCancelled { pid });
+                continue;
+            }
+            match result {
+                Ok(raw) => {
+                    let _ = tx.send(StoryEvent::FillDone { pid, raw });
+                }
+                Err(e) => {
+                    let _ = tx.send(StoryEvent::FillError {
+                        pid,
+                        error: format!("{e:#}"),
+                    });
+                }
+            }
+            ctx.request_repaint();
+        }
+        // Mark generation done. We piggy-back on FillCancelled when no events
+        // remain — simpler: send a sentinel via FillError on a non-existent PID
+        // or use a dedicated event. Use a dedicated approach: drain side
+        // detects no in-flight pids and clears `fill_generating`.
+        let _ = tx.send(StoryEvent::FillCancelled { pid: 0 });
+        ctx.request_repaint();
+    });
+}
+
+// =============================================================================
+// Drain async events into UI state
+// =============================================================================
+
+pub fn drain_all_editor_events(state: &mut AppState) {
+    let ids: Vec<Ulid> = state.editors.keys().copied().collect();
+    for id in ids {
+        // We pull the receiver out with mem::replace to avoid holding a mutable
+        // borrow on `state.editors` while also mutating other AppState fields
+        // (e.g. story body).
+        let mut events = Vec::new();
+        if let Some(ed) = state.editors.get_mut(&id) {
+            while let Ok(ev) = ed.rx.try_recv() {
+                events.push(ev);
+            }
+        }
+        for ev in events {
+            apply_event(state, id, ev);
+        }
+    }
+}
+
+fn apply_event(state: &mut AppState, id: Ulid, ev: StoryEvent) {
+    match ev {
+        StoryEvent::ProposalDelta { pid, chunk } => {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                if let Some(p) = ed.proposals.iter_mut().find(|p| p.id == pid) {
+                    p.raw.push_str(&chunk);
+                }
+            }
+        }
+        StoryEvent::ProposalsDone {
+            placeholder_pid,
+            raw,
+        } => {
+            let visible = visible_text(&raw).0;
+            let blocks = parse_numbered_blocks(&visible);
+            if let Some(ed) = state.editors.get_mut(&id) {
+                ed.proposals.retain(|p| p.id != placeholder_pid);
+                if blocks.is_empty() {
+                    let pid = ed.next_pid();
+                    ed.proposals.push(Proposal {
                         id: pid,
-                        raw: String::new(),
-                        pending: true,
+                        raw,
+                        pending: false,
                         error: None,
                     });
-                    let on_delta = move |chunk: &str| {
-                        let mut p = proposals.write();
-                        if let Some(idx) = find_idx(&p, pid) {
-                            p[idx].raw.push_str(chunk);
-                        }
-                    };
-                    let result = client
-                        .stream_continuation(
-                            &prompts_dir,
-                            &story,
-                            &snapshot_ideas,
-                            cancel_flag.clone(),
-                            on_delta,
-                        )
-                        .await;
-                    if cancel_flag.load(Ordering::SeqCst) {
-                        let mut p = proposals.write();
-                        if let Some(idx) = find_idx(&p, pid) { p.remove(idx); }
-                        break;
-                    }
-                    let mut p = proposals.write();
-                    if let Some(idx) = find_idx(&p, pid) {
-                        match result {
-                            Ok(raw) => p[idx] = Proposal { id: pid, raw, pending: false, error: None },
-                            Err(e) => p[idx] = Proposal { id: pid, raw: String::new(), pending: false, error: Some(format!("{e}")) },
-                        }
+                } else {
+                    let mut keys: Vec<usize> = blocks.keys().copied().collect();
+                    keys.sort();
+                    for k in keys {
+                        let pid = ed.next_pid();
+                        ed.proposals.push(Proposal {
+                            id: pid,
+                            raw: blocks[&k].clone(),
+                            pending: false,
+                            error: None,
+                        });
                     }
                 }
-                generating.set(false);
-            });
-        }
-    };
-
-    let on_auto = {
-        let cancel_flag = cancel_flag.clone();
-        let llm_cfg = llm_cfg.clone();
-        let prompts_dir = prompts_dir.clone();
-        move |_| {
-            let n = *count.read();
-            if n == 0 || *generating.read() || *auto_running.read() { return; }
-            cancel_flag.store(false, Ordering::SeqCst);
-            auto_running.set(true);
-            auto_progress.set((0, n));
-            auto_live.set(String::new());
-
-            let snapshot_ideas = state.read().ideas.clone();
-            let llm_cfg = llm_cfg.clone();
-            let prompts_dir = prompts_dir.clone();
-            let cancel_flag = cancel_flag.clone();
-
-            spawn(async move {
-                let client = LlmClient::new(llm_cfg);
-                for i in 0..n {
-                    if cancel_flag.load(Ordering::SeqCst) { break; }
-                    auto_progress.set((i, n));
-                    auto_live.set(String::new());
-
-                    let Some(story) = state.read().story(id).cloned() else { break; };
-                    let on_delta = move |chunk: &str| {
-                        let mut s = auto_live.write();
-                        s.push_str(chunk);
-                    };
-                    let result = client
-                        .stream_continuation(
-                            &prompts_dir,
-                            &story,
-                            &snapshot_ideas,
-                            cancel_flag.clone(),
-                            on_delta,
-                        )
-                        .await;
-                    if cancel_flag.load(Ordering::SeqCst) { break; }
-                    match result {
-                        Ok(raw) => {
-                            let visible = visible_text(&raw).0.trim().to_string();
-                            if visible.is_empty() {
-                                tracing::warn!("auto mode: empty visible content, stopping");
-                                break;
-                            }
-                            let new_body = {
-                                let mut g = state.write();
-                                if let Some(s) = g.story_mut(id) {
-                                    s.append_body(&visible);
-                                    s.body.clone()
-                                } else { break; }
-                            };
-                            save_story(state, id);
-                            push_body_to_dom(&new_body);
-                        }
-                        Err(e) => {
-                            tracing::error!(?e, "auto mode generation failed");
-                            break;
-                        }
-                    }
-                }
-                auto_progress.set((n, n));
-                auto_live.set(String::new());
-                auto_running.set(false);
-            });
-        }
-    };
-
-    let on_compact = {
-        let cancel_flag = cancel_flag.clone();
-        let llm_cfg = llm_cfg.clone();
-        let prompts_dir = prompts_dir.clone();
-        move |_| {
-            if *generating.read() || *auto_running.read() || *compacting.read() { return; }
-            cancel_flag.store(false, Ordering::SeqCst);
-            compacting.set(true);
-            compact_error.set(None);
-            compact_live.set(String::new());
-
-            let snapshot_story = state.read().story(id).cloned();
-            let snapshot_ideas = state.read().ideas.clone();
-            let llm_cfg = llm_cfg.clone();
-            let prompts_dir = prompts_dir.clone();
-            let cancel_flag = cancel_flag.clone();
-
-            spawn(async move {
-                let Some(story) = snapshot_story else { compacting.set(false); return; };
-                let client = LlmClient::new(llm_cfg);
-                let on_delta = move |chunk: &str| {
-                    compact_live.write().push_str(chunk);
-                };
-                let result = client
-                    .compact_body(&prompts_dir, &story, &snapshot_ideas, cancel_flag.clone(), on_delta)
-                    .await;
-                match result {
-                    Ok(new_body) => {
-                        {
-                            let mut g = state.write();
-                            if let Some(s) = g.story_mut(id) {
-                                s.replace_body(new_body.clone());
-                            }
-                        }
-                        save_story(state, id);
-                        push_body_to_dom(&new_body);
-                    }
-                    Err(e) => {
-                        compact_error.set(Some(format!("{e:#}")));
-                    }
-                }
-                compact_live.set(String::new());
-                compacting.set(false);
-            });
-        }
-    };
-
-    let on_cancel = {
-        let cancel_flag = cancel_flag.clone();
-        move |_| {
-            cancel_flag.store(true, Ordering::SeqCst);
-        }
-    };
-
-    rsx! {
-        div { class: "story-layout",
-            // meta row
-            div { class: "story-meta",
-                input { r#type: "text", initial_value: "{title}",
-                    oninput: move |e| {
-                        let v = e.value();
-                        if let Some(s) = state.write().story_mut(id) { s.meta.title = v; }
-                    },
-                    onblur: move |_| save_story(state, id),
-                }
-                select {
-                    value: match language { Language::Ja => "ja", Language::En => "en" },
-                    onchange: move |e| {
-                        let lang = if e.value() == "en" { Language::En } else { Language::Ja };
-                        if let Some(s) = state.write().story_mut(id) { s.meta.language = lang; }
-                        save_story(state, id);
-                    },
-                    option { value: "ja", "日本語" }
-                    option { value: "en", "English" }
-                }
-                label { style: "display: flex; gap: 4px; align-items: center;",
-                    input { r#type: "checkbox", checked: nsfw,
-                        oninput: move |e| {
-                            let v = e.value() == "true";
-                            if let Some(s) = state.write().story_mut(id) { s.meta.nsfw = v; }
-                            save_story(state, id);
-                        },
-                    }
-                    "NSFW"
-                }
-                label {
-                    style: "display: flex; gap: 4px; align-items: center;",
-                    title: "reasoning_effort=none を送信。Qwen3 等の reasoning モデルで思考トークンを抑止",
-                    input { r#type: "checkbox", checked: disable_thinking,
-                        oninput: move |e| {
-                            let v = e.value() == "true";
-                            state.write().config.llm.disable_thinking = v;
-                            if let Err(e) = state.read().save_config() {
-                                tracing::error!(?e, "save config");
-                            }
-                        },
-                    }
-                    "Thinking 無効"
-                }
-                button { class: "danger",
-                    onclick: move |_| {
-                        let _ = state.write().delete_story(id);
-                        state.write().selection = Selection::None;
-                    },
-                    "削除"
-                }
+                ed.generating = false;
             }
+        }
+        StoryEvent::ProposalsError {
+            placeholder_pid,
+            error,
+        } => {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                if let Some(p) = ed.proposals.iter_mut().find(|p| p.id == placeholder_pid) {
+                    p.pending = false;
+                    p.error = Some(error);
+                    p.raw.clear();
+                }
+                ed.generating = false;
+            }
+        }
+        StoryEvent::ProposalsCancelled { placeholder_pid } => {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                ed.proposals.retain(|p| p.id != placeholder_pid);
+                ed.generating = false;
+            }
+        }
 
-            // active ideas
-            div { class: "idea-toggles",
-                for (iid, ititle, on, auto_only) in all_ideas_with_status {
-                    {
-                        let class = if auto_only { "chip auto" } else if on { "chip on" } else { "chip" };
-                        rsx! {
-                            span {
-                                key: "{iid}",
-                                class: "{class}",
-                                title: if auto_only { "依存により自動有効" } else { "" },
-                                onclick: move |_| {
-                                    if auto_only { return; }
-                                    if let Some(s) = state.write().story_mut(id) {
-                                        if let Some(pos) = s.meta.active_ideas.iter().position(|x| *x == iid) {
-                                            s.meta.active_ideas.remove(pos);
-                                        } else {
-                                            s.meta.active_ideas.push(iid);
-                                        }
-                                    }
-                                    save_story(state, id);
-                                },
-                                "{ititle}"
-                            }
-                        }
+        StoryEvent::AutoDelta { chunk } => {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                ed.auto_live.push_str(&chunk);
+            }
+        }
+        StoryEvent::AutoDone { raw, cancelled } => {
+            let visible = visible_text(&raw).0;
+            let blocks = parse_numbered_blocks(&visible);
+            let mut keys: Vec<usize> = blocks.keys().copied().collect();
+            keys.sort();
+            let mut appended = 0u32;
+            if keys.is_empty() && !cancelled {
+                let prose = strip_author_notes(&visible).trim().to_string();
+                if !prose.is_empty() {
+                    if let Some(s) = state.story_mut(id) {
+                        s.append_body(&prose);
+                    }
+                    state.save_story_now(id);
+                    appended = 1;
+                }
+            } else {
+                for k in keys {
+                    let prose = strip_author_notes(&blocks[&k]).trim().to_string();
+                    if prose.is_empty() {
+                        continue;
+                    }
+                    if let Some(s) = state.story_mut(id) {
+                        s.append_body(&prose);
+                    }
+                    state.save_story_now(id);
+                    appended += 1;
+                    if let Some(ed) = state.editors.get_mut(&id) {
+                        ed.auto_progress = (appended, ed.count);
                     }
                 }
             }
+            if appended == 0 {
+                tracing::warn!("auto mode: no blocks parsed from response");
+            }
+            if let Some(ed) = state.editors.get_mut(&id) {
+                ed.auto_progress = (ed.count, ed.count);
+                ed.auto_live.clear();
+                ed.auto_running = false;
+            }
+        }
+        StoryEvent::AutoError { error } => {
+            tracing::error!(error = %error, "auto mode generation failed");
+            if let Some(ed) = state.editors.get_mut(&id) {
+                ed.auto_running = false;
+                ed.auto_live.clear();
+            }
+        }
 
-            // body
-            div { class: "story-body",
-                textarea {
-                    id: "{STORY_BODY_DOM_ID}",
-                    initial_value: "{body}",
-                    oninput: move |e| {
-                        let v = e.value();
-                        if let Some(s) = state.write().story_mut(id) { s.body = v; }
-                    },
-                    onblur: move |_| save_story(state, id),
+        StoryEvent::CompactDelta { chunk } => {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                ed.compact_live.push_str(&chunk);
+            }
+        }
+        StoryEvent::CompactDone { new_body } => {
+            if let Some(s) = state.story_mut(id) {
+                s.replace_body(new_body);
+            }
+            state.save_story_now(id);
+            if let Some(ed) = state.editors.get_mut(&id) {
+                ed.compact_live.clear();
+                ed.compacting = false;
+            }
+        }
+        StoryEvent::CompactError { error } => {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                ed.compact_error = Some(error);
+                ed.compact_live.clear();
+                ed.compacting = false;
+            }
+        }
+
+        StoryEvent::FillDelta { pid, chunk } => {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                if let Some(p) = ed.fill_proposals.iter_mut().find(|p| p.id == pid) {
+                    p.raw.push_str(&chunk);
                 }
             }
-
-            // generation panel
-            div { class: "gen-panel",
-                div { class: "gen-controls",
-                    button {
-                        class: "primary",
-                        disabled: *generating.read() || *auto_running.read(),
-                        onclick: on_generate,
-                        title: "案を N 個生成して提示。採用したものだけ本文に追加",
-                        if *generating.read() { "生成中…" } else { "続きを生成 (案出し)" }
-                    }
-                    button {
-                        disabled: *generating.read() || *auto_running.read() || *compacting.read(),
-                        onclick: on_auto,
-                        title: "N 回連続で生成 → 自動で本文に追加。ボツ案なし",
-                        {
-                            let (done, total) = *auto_progress.read();
-                            if *auto_running.read() {
-                                rsx!{ "自動連投中… {done}/{total}" }
-                            } else {
-                                rsx!{ "自動連投" }
-                            }
-                        }
-                    }
-                    button {
-                        disabled: *generating.read() || *auto_running.read() || *compacting.read(),
-                        onclick: on_compact,
-                        title: "本文の前半を要約に置き換えてコンテキスト消費を抑える。直近1500文字程度は残る",
-                        if *compacting.read() { "圧縮中…" } else { "圧縮" }
-                    }
-                    label { "回数:" }
-                    input { r#type: "number", min: "1", max: "20",
-                        value: "{count}",
-                        oninput: move |e| {
-                            if let Ok(n) = e.value().parse::<u32>() { count.set(n.max(1).min(20)); }
-                        },
-                    }
-                    if *generating.read() || *auto_running.read() || *compacting.read() {
-                        button { class: "danger", onclick: on_cancel, "キャンセル" }
-                    }
-                    if !proposals.read().is_empty() {
-                        button {
-                            onclick: move |_| proposals.set(Vec::new()),
-                            "すべて破棄"
-                        }
-                    }
-                    span { style: "margin-left:auto; color:#8a8f99;",
-                        "案: {proposals.read().len()}"
-                    }
-                }
-                if let Some(err) = compact_error.read().clone() {
-                    div { style: "background:#3a1f22; border:1px solid #6b3030; border-radius:4px; padding:10px; color:#ffb0b0;",
-                        "圧縮失敗: {err}"
-                        button { style: "margin-left: 8px;",
-                            onclick: move |_| compact_error.set(None),
-                            "閉じる"
-                        }
-                    }
-                }
-                if *compacting.read() {
-                    {
-                        let live = compact_live.read().clone();
-                        let (visible, in_think) = visible_text(&live);
-                        let visible = visible.trim_start().to_string();
-                        rsx! {
-                            div { class: "proposal pending",
-                                div { style: "color:#9aa0aa; font-size: 11px; margin-bottom: 4px;",
-                                    "圧縮中: 前半を要約に置換します"
-                                }
-                                div { class: "text",
-                                    if visible.is_empty() {
-                                        span { style: "color:#8a8f99;",
-                                            if in_think { "考え中…" } else { "要約開始待ち…" }
-                                        }
-                                    } else {
-                                        "{visible}"
-                                        span { style: "color:#8a8f99;",
-                                            if in_think { " 〔思考中〕" } else { " ▍" }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if *auto_running.read() {
-                    {
-                        let live = auto_live.read().clone();
-                        let (visible, in_think) = visible_text(&live);
-                        let visible = visible.trim_start().to_string();
-                        rsx! {
-                            div { class: "proposal pending",
-                                div { class: "text",
-                                    if visible.is_empty() {
-                                        span { style: "color:#8a8f99;",
-                                            if in_think { "考え中…" } else { "生成開始待ち…" }
-                                        }
-                                    } else {
-                                        "{visible}"
-                                        span { style: "color:#8a8f99;",
-                                            if in_think { " 〔思考中〕" } else { " ▍" }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                for prop in proposals.read().iter().cloned() {
-                    {
-                        let pid = prop.id;
-                        let (visible, in_think) = visible_text(&prop.raw);
-                        let visible = visible.trim_start().to_string();
-                        rsx! {
-                            div {
-                                key: "{pid}",
-                                class: if prop.pending { "proposal pending" } else { "proposal" },
-                                if let Some(err) = prop.error.clone() {
-                                    div { class: "text", style: "color:#ff8080;", "エラー: {err}" }
-                                    div { class: "actions",
-                                        button {
-                                            onclick: move |_| {
-                                                let mut p = proposals.write();
-                                                if let Some(idx) = find_idx(&p, pid) { p.remove(idx); }
-                                            },
-                                            "閉じる"
-                                        }
-                                    }
-                                } else {
-                                    if visible.is_empty() && prop.pending {
-                                        div { class: "text", style: "color:#8a8f99;",
-                                            if in_think { "考え中…" } else { "生成開始待ち…" }
-                                        }
-                                    } else {
-                                        div { class: "text",
-                                            "{visible}"
-                                            if prop.pending {
-                                                span { style: "color:#8a8f99;",
-                                                    if in_think { " 〔思考中〕" } else { " ▍" }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    div { class: "actions",
-                                        button {
-                                            disabled: prop.pending,
-                                            onclick: move |_| {
-                                                let mut p = proposals.write();
-                                                if let Some(idx) = find_idx(&p, pid) { p.remove(idx); }
-                                            },
-                                            "破棄"
-                                        }
-                                        button {
-                                            class: "primary",
-                                            disabled: prop.pending || visible.is_empty(),
-                                            onclick: {
-                                                let text = visible.clone();
-                                                move |_| {
-                                                    let new_body = {
-                                                        let mut g = state.write();
-                                                        if let Some(s) = g.story_mut(id) {
-                                                            s.append_body(&text);
-                                                            s.body.clone()
-                                                        } else {
-                                                            return;
-                                                        }
-                                                    };
-                                                    save_story(state, id);
-                                                    push_body_to_dom(&new_body);
-                                                    let mut p = proposals.write();
-                                                    if let Some(idx) = find_idx(&p, pid) { p.remove(idx); }
-                                                }
-                                            },
-                                            "採用"
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+        }
+        StoryEvent::FillDone { pid, raw } => {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                if let Some(p) = ed.fill_proposals.iter_mut().find(|p| p.id == pid) {
+                    p.raw = raw;
+                    p.pending = false;
                 }
             }
+            update_fill_generating_flag(state, id);
+        }
+        StoryEvent::FillError { pid, error } => {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                if let Some(p) = ed.fill_proposals.iter_mut().find(|p| p.id == pid) {
+                    p.pending = false;
+                    p.error = Some(error);
+                }
+            }
+            update_fill_generating_flag(state, id);
+        }
+        StoryEvent::FillCancelled { pid } => {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                if pid != 0 {
+                    ed.fill_proposals.retain(|p| p.id != pid);
+                }
+            }
+            update_fill_generating_flag(state, id);
+        }
+    }
+}
+
+fn update_fill_generating_flag(state: &mut AppState, id: Ulid) {
+    if let Some(ed) = state.editors.get_mut(&id) {
+        let any_pending = ed.fill_proposals.iter().any(|p| p.pending);
+        if !any_pending {
+            ed.fill_generating = false;
         }
     }
 }

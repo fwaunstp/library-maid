@@ -1,37 +1,25 @@
-use crate::data::story::Language;
 use anyhow::{Context, Result};
 use std::path::Path;
 
-const NSFW_JA: &str = include_str!("defaults/nsfw_ja.md");
-const NSFW_EN: &str = include_str!("defaults/nsfw_en.md");
-const SFW_JA: &str = include_str!("defaults/sfw_ja.md");
-const SFW_EN: &str = include_str!("defaults/sfw_en.md");
-const COMPACT_JA: &str = include_str!("defaults/compact_ja.md");
-const COMPACT_EN: &str = include_str!("defaults/compact_en.md");
+const NSFW: &str = include_str!("defaults/nsfw.md");
+const SFW: &str = include_str!("defaults/sfw.md");
+const AUTO_NSFW: &str = include_str!("defaults/auto_nsfw.md");
+const AUTO_SFW: &str = include_str!("defaults/auto_sfw.md");
+const COMPACT: &str = include_str!("defaults/compact.md");
+const FILL: &str = include_str!("defaults/fill.md");
 
 #[derive(Debug, Clone, Copy)]
 pub struct PromptKey {
-    pub language: Language,
     pub nsfw: bool,
 }
 
 impl PromptKey {
     pub fn filename(self) -> &'static str {
-        match (self.nsfw, self.language) {
-            (true, Language::Ja) => "nsfw_ja.md",
-            (true, Language::En) => "nsfw_en.md",
-            (false, Language::Ja) => "sfw_ja.md",
-            (false, Language::En) => "sfw_en.md",
-        }
+        if self.nsfw { "nsfw.md" } else { "sfw.md" }
     }
 
     fn default_template(self) -> &'static str {
-        match (self.nsfw, self.language) {
-            (true, Language::Ja) => NSFW_JA,
-            (true, Language::En) => NSFW_EN,
-            (false, Language::Ja) => SFW_JA,
-            (false, Language::En) => SFW_EN,
-        }
+        if self.nsfw { NSFW } else { SFW }
     }
 }
 
@@ -55,18 +43,30 @@ pub fn render(template: &str, vars: &[(&str, &str)]) -> String {
     out
 }
 
-pub fn load_compact_template(prompts_dir: &Path, language: Language) -> Result<String> {
-    let filename = match language {
-        Language::Ja => "compact_ja.md",
-        Language::En => "compact_en.md",
-    };
+pub fn load_compact_template(prompts_dir: &Path) -> Result<String> {
+    let override_path = prompts_dir.join("compact.md");
+    if override_path.exists() {
+        return std::fs::read_to_string(&override_path)
+            .with_context(|| format!("read override prompt {override_path:?}"));
+    }
+    Ok(COMPACT.to_string())
+}
+
+pub fn load_auto_template(prompts_dir: &Path, key: PromptKey) -> Result<String> {
+    let filename = if key.nsfw { "auto_nsfw.md" } else { "auto_sfw.md" };
     let override_path = prompts_dir.join(filename);
     if override_path.exists() {
         return std::fs::read_to_string(&override_path)
             .with_context(|| format!("read override prompt {override_path:?}"));
     }
-    Ok(match language {
-        Language::Ja => COMPACT_JA,
-        Language::En => COMPACT_EN,
-    }.to_string())
+    Ok(if key.nsfw { AUTO_NSFW } else { AUTO_SFW }.to_string())
+}
+
+pub fn load_fill_template(prompts_dir: &Path) -> Result<String> {
+    let override_path = prompts_dir.join("fill.md");
+    if override_path.exists() {
+        return std::fs::read_to_string(&override_path)
+            .with_context(|| format!("read override prompt {override_path:?}"));
+    }
+    Ok(FILL.to_string())
 }

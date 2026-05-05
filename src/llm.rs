@@ -1,4 +1,4 @@
-use crate::data::{Idea, Story, story::Language};
+use crate::data::{Idea, Story};
 use crate::prompts::{self, PromptKey};
 use anyhow::{Context, Result};
 use async_openai::{
@@ -94,34 +94,71 @@ impl LlmClient {
         }
     }
 
-    /// Stream a continuation, calling `on_delta` with each raw text chunk
-    /// (which may include `<think>...</think>` blocks). Stops early if `cancel` flips.
-    /// Returns the full accumulated raw text on success.
-    pub async fn stream_continuation<F: FnMut(&str)>(
+    /// Stream `count` independent candidate continuations of the draft in a
+    /// single API call. The model returns `# #1\n…\n# #2\n…` blocks; the
+    /// caller parses them with `parse_numbered_blocks`. Each candidate is an
+    /// alternative for the same draft (not a chain).
+    pub async fn stream_proposals<F: FnMut(&str) + Send>(
         &self,
         prompts_dir: &Path,
         story: &Story,
         ideas: &[Idea],
+        count: u32,
+        cancel: Arc<AtomicBool>,
+        on_delta: F,
+    ) -> Result<String> {
+        let key = PromptKey { nsfw: story.meta.nsfw };
+        let template = prompts::load_template(prompts_dir, key)?;
+        self.stream_numbered(prompts_dir, story, ideas, &template, count, cancel, on_delta)
+            .await
+    }
+
+    /// Stream `count` sequential continuations in a single API call (auto-continue
+    /// mode). The model returns `# #1\n…\n# #2\n…` blocks where each block
+    /// picks up where the previous one ended. The caller appends them in order
+    /// to the draft.
+    pub async fn stream_auto_batch<F: FnMut(&str) + Send>(
+        &self,
+        prompts_dir: &Path,
+        story: &Story,
+        ideas: &[Idea],
+        count: u32,
+        cancel: Arc<AtomicBool>,
+        on_delta: F,
+    ) -> Result<String> {
+        let key = PromptKey { nsfw: story.meta.nsfw };
+        let template = prompts::load_auto_template(prompts_dir, key)?;
+        self.stream_numbered(prompts_dir, story, ideas, &template, count, cancel, on_delta)
+            .await
+    }
+
+    /// Shared implementation for batched `# #N`-formatted output.
+    async fn stream_numbered<F: FnMut(&str) + Send>(
+        &self,
+        _prompts_dir: &Path,
+        story: &Story,
+        ideas: &[Idea],
+        template: &str,
+        count: u32,
         cancel: Arc<AtomicBool>,
         mut on_delta: F,
     ) -> Result<String> {
-        let key = PromptKey {
-            language: story.meta.language,
-            nsfw: story.meta.nsfw,
-        };
-        let template = prompts::load_template(prompts_dir, key)?;
-
+        let count = count.max(1);
         let active = resolve_active_ideas(ideas, &story.meta.active_ideas);
-        let ideas_block = format_ideas(&active, story.meta.language);
+        let ideas_block = format_ideas(&active);
         let body_block = if story.body.trim().is_empty() {
-            placeholder_empty_body(story.meta.language).to_string()
+            placeholder_empty_body().to_string()
         } else {
             story.body.clone()
         };
-
+        let count_str = count.to_string();
         let user_prompt = prompts::render(
-            &template,
-            &[("ideas", &ideas_block), ("body", &body_block)],
+            template,
+            &[
+                ("ideas", &ideas_block),
+                ("body", &body_block),
+                ("count", &count_str),
+            ],
         );
 
         let mut builder = CreateChatCompletionRequestArgs::default();
@@ -191,7 +228,7 @@ impl LlmClient {
     /// that portion is replaced with the summary, separated by `〔ここまでの要約〕…〔要約ここまで〕`
     /// markers. The trailing `keep_recent_chars` characters (snapped forward
     /// to the next paragraph break) are preserved verbatim.
-    pub async fn compact_body<F: FnMut(&str)>(
+    pub async fn compact_body<F: FnMut(&str) + Send>(
         &self,
         prompts_dir: &Path,
         story: &Story,
@@ -207,9 +244,9 @@ impl LlmClient {
             ));
         }
 
-        let template = prompts::load_compact_template(prompts_dir, story.meta.language)?;
+        let template = prompts::load_compact_template(prompts_dir)?;
         let active = resolve_active_ideas(ideas, &story.meta.active_ideas);
-        let ideas_block = format_ideas(&active, story.meta.language);
+        let ideas_block = format_ideas(&active);
         let user_prompt = prompts::render(
             &template,
             &[("ideas", &ideas_block), ("body", &to_summarize)],
@@ -260,21 +297,100 @@ impl LlmClient {
             ));
         }
 
-        let lang = story.meta.language;
-        let header = match lang {
-            Language::Ja => "〔ここまでのあらすじ要約〕",
-            Language::En => "[Summary of the story so far]",
-        };
-        let footer = match lang {
-            Language::Ja => "〔要約ここまで / 以下、続き〕",
-            Language::En => "[End summary / continuation follows]",
-        };
-        let mut new_body = format!("{header}\n{summary}\n{footer}");
+        let mut new_body = format!("<!-- DIGEST:\n{summary}\n-->");
         if !kept_recent.is_empty() {
             new_body.push_str("\n\n");
             new_body.push_str(&kept_recent);
         }
         Ok(new_body)
+    }
+}
+
+impl LlmClient {
+    /// Stream a single fill-in proposal that covers every `<!-- FILL: ... -->`
+    /// marker in `story.body`. The model receives the body with FILL markers
+    /// replaced by `[FILL #N: hint]` and must answer with `# #N` blocks.
+    /// Returns the raw accumulated text on success; the caller parses it with
+    /// `parse_numbered_blocks` and applies it with `apply_fills`.
+    pub async fn stream_fill<F: FnMut(&str) + Send>(
+        &self,
+        prompts_dir: &Path,
+        story: &Story,
+        ideas: &[Idea],
+        slots: &[FillSlot],
+        cancel: Arc<AtomicBool>,
+        mut on_delta: F,
+    ) -> Result<String> {
+        if slots.is_empty() {
+            return Err(anyhow::anyhow!("本文に `<!-- FILL: ... -->` がありません"));
+        }
+        let template = prompts::load_fill_template(prompts_dir)?;
+        let active = resolve_active_ideas(ideas, &story.meta.active_ideas);
+        let ideas_block = format_ideas(&active);
+        let body_block = body_with_numbered_markers(&story.body, slots);
+        let user_prompt = prompts::render(
+            &template,
+            &[("ideas", &ideas_block), ("body", &body_block)],
+        );
+
+        let mut builder = CreateChatCompletionRequestArgs::default();
+        builder
+            .model(&self.cfg.model)
+            .temperature(self.cfg.temperature)
+            .top_p(self.cfg.top_p)
+            .max_tokens(self.cfg.max_tokens)
+            .messages([ChatCompletionRequestUserMessageArgs::default()
+                .content(user_prompt)
+                .build()?
+                .into()]);
+        if self.cfg.disable_thinking {
+            builder.reasoning_effort(ReasoningEffort::None);
+        }
+        let request = builder.build()?;
+
+        let mut stream = self
+            .client
+            .chat()
+            .create_stream(request)
+            .await
+            .context("fill create_stream failed")?;
+
+        let mut accumulated = String::new();
+        let mut last_finish: Option<FinishReason> = None;
+        while let Some(chunk) = stream.next().await {
+            if cancel.load(Ordering::SeqCst) {
+                return Ok(accumulated);
+            }
+            let chunk = chunk.context("stream chunk error")?;
+            for choice in chunk.choices {
+                if let Some(reason) = choice.finish_reason {
+                    last_finish = Some(reason);
+                }
+                if let Some(content) = choice.delta.content {
+                    if !content.is_empty() {
+                        accumulated.push_str(&content);
+                        on_delta(&content);
+                    }
+                }
+            }
+        }
+
+        let visible = visible_text(&accumulated).0;
+        if visible.trim().is_empty() {
+            let hint = match last_finish {
+                Some(FinishReason::Length) => {
+                    "max_tokens に達した。設定を見直してください"
+                }
+                Some(FinishReason::ContentFilter) => {
+                    "content_filter で削除された (NSFW 拒否)。別モデルを検討してください"
+                }
+                _ => "プロンプト形式やテンプレートを確認してください",
+            };
+            return Err(anyhow::anyhow!(
+                "empty visible content (finish_reason={last_finish:?})\n→ {hint}"
+            ));
+        }
+        Ok(accumulated)
     }
 }
 
@@ -304,6 +420,148 @@ pub fn split_for_compaction(body: &str, keep_recent_chars: usize) -> (String, St
             body[..split_byte].to_string(),
             body[split_byte..].trim_start().to_string(),
         )
+    }
+}
+
+/// A `<!-- FILL: hint -->` placeholder slot found in the body.
+#[derive(Debug, Clone)]
+pub struct FillSlot {
+    /// Byte range of the entire `<!-- FILL: ... -->` marker in the original body.
+    pub range: std::ops::Range<usize>,
+    /// Hint text after the colon (trimmed). Empty when the user wrote `<!-- FILL: -->`.
+    pub hint: String,
+}
+
+/// Find every `<!-- FILL: hint -->` marker in `body`, in document order.
+pub fn extract_fills(body: &str) -> Vec<FillSlot> {
+    let mut slots = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = body[i..].find("<!--") {
+        let start = i + rel;
+        let Some(rel_end) = body[start..].find("-->") else { break; };
+        let end = start + rel_end + 3;
+        let inside = &body[start + 4..start + rel_end];
+        let trimmed = inside.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("FILL") {
+            if let Some(hint_part) = rest.trim_start().strip_prefix(':') {
+                slots.push(FillSlot {
+                    range: start..end,
+                    hint: hint_part.trim().to_string(),
+                });
+            }
+        }
+        i = end;
+    }
+    slots
+}
+
+/// Render `body` with each FILL slot replaced by `[FILL #N: hint]` (or `[FILL #N]`
+/// when the hint is empty). The numbering matches the order of `slots`.
+pub fn body_with_numbered_markers(body: &str, slots: &[FillSlot]) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut last = 0;
+    for (i, slot) in slots.iter().enumerate() {
+        out.push_str(&body[last..slot.range.start]);
+        let n = i + 1;
+        if slot.hint.is_empty() {
+            out.push_str(&format!("[FILL #{n}]"));
+        } else {
+            out.push_str(&format!("[FILL #{n}: {}]", slot.hint));
+        }
+        last = slot.range.end;
+    }
+    out.push_str(&body[last..]);
+    out
+}
+
+/// Parse `# #N`-delimited blocks (used for FILL, multi-proposals, and
+/// auto-batch). Each block's body is the lines after `# #N` up to the next
+/// header or end of input. Returns a map from N to body.
+///
+/// `#` (h1) is used rather than `##` (h2) because h1 is reserved for document
+/// titles in Markdown, so it almost never appears mid-prose — making it a
+/// safer delimiter that won't collide with the body's own headings.
+pub fn parse_numbered_blocks(text: &str) -> std::collections::HashMap<usize, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut current: Option<(usize, String)> = None;
+    let flush = |cur: &mut Option<(usize, String)>, map: &mut std::collections::HashMap<usize, String>| {
+        if let Some((n, buf)) = cur.take() {
+            let trimmed = buf.trim().to_string();
+            if !trimmed.is_empty() {
+                map.insert(n, trimmed);
+            }
+        }
+    };
+    for line in text.lines() {
+        let t = line.trim_start();
+        // Match exactly one `#` (h1), not `##`/`###` etc.
+        if let Some(rest) = t.strip_prefix('#') {
+            if !rest.starts_with('#') {
+                let rest = rest.trim_start();
+                if let Some(num_part) = rest.strip_prefix('#') {
+                    let digit_end = num_part.find(|c: char| !c.is_ascii_digit()).unwrap_or(num_part.len());
+                    if digit_end > 0 {
+                        if let Ok(n) = num_part[..digit_end].parse::<usize>() {
+                            flush(&mut current, &mut map);
+                            current = Some((n, String::new()));
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((_, buf)) = current.as_mut() {
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            buf.push_str(line);
+        }
+    }
+    flush(&mut current, &mut map);
+    map
+}
+
+/// Substitute each FILL slot in `body` with the prose from `fills` (keyed by
+/// the 1-based slot number). Slots without a corresponding entry are left
+/// as-is (the original `<!-- FILL: ... -->` marker is preserved).
+pub fn apply_fills(
+    body: &str,
+    slots: &[FillSlot],
+    fills: &std::collections::HashMap<usize, String>,
+) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut last = 0;
+    for (i, slot) in slots.iter().enumerate() {
+        out.push_str(&body[last..slot.range.start]);
+        let n = i + 1;
+        match fills.get(&n) {
+            Some(text) => out.push_str(text),
+            None => out.push_str(&body[slot.range.clone()]),
+        }
+        last = slot.range.end;
+    }
+    out.push_str(&body[last..]);
+    out
+}
+
+/// Strip well-formed `<!-- ... -->` HTML comments (author's notes) from text.
+/// Defensive: prompts already tell the model not to emit them, but a misbehaving
+/// model occasionally echoes them. Unclosed `<!--` is left as-is so the user
+/// notices the mismatch.
+pub fn strip_author_notes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let Some(start) = rest.find("<!--") else {
+            out.push_str(rest);
+            return out;
+        };
+        let Some(rel_end) = rest[start..].find("-->") else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..start]);
+        rest = &rest[start + rel_end + 3..];
     }
 }
 
@@ -361,12 +619,9 @@ pub fn resolve_active_ideas<'a>(all: &'a [Idea], explicit: &[Ulid]) -> Vec<&'a I
     all.iter().filter(|i| active.contains(&i.meta.id)).collect()
 }
 
-fn format_ideas(ideas: &[&Idea], lang: Language) -> String {
+fn format_ideas(ideas: &[&Idea]) -> String {
     if ideas.is_empty() {
-        return match lang {
-            Language::Ja => "（特になし）".to_string(),
-            Language::En => "(none)".to_string(),
-        };
+        return "(none)".to_string();
     }
     let mut out = String::new();
     for idea in ideas {
@@ -375,9 +630,6 @@ fn format_ideas(ideas: &[&Idea], lang: Language) -> String {
     out.trim_end().to_string()
 }
 
-fn placeholder_empty_body(lang: Language) -> &'static str {
-    match lang {
-        Language::Ja => "（まだ本文はありません。冒頭から書き始めてください。）",
-        Language::En => "(No draft yet. Begin from the opening.)",
-    }
+fn placeholder_empty_body() -> &'static str {
+    "(No draft yet. Begin from the opening.)"
 }

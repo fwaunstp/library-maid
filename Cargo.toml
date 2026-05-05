@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-dioxus = { version = "0.7", features = ["desktop", "router"] }
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.32"
 
 tokio = { version = "1", features = ["full"] }
 async-openai = { version = "0.36", default-features = false, features = ["rustls", "chat-completion"] }
