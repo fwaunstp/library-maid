@@ -7,6 +7,7 @@ const AUTO_NSFW: &str = include_str!("defaults/auto_nsfw.md");
 const AUTO_SFW: &str = include_str!("defaults/auto_sfw.md");
 const COMPACT: &str = include_str!("defaults/compact.md");
 const FILL: &str = include_str!("defaults/fill.md");
+const TITLE: &str = include_str!("defaults/title.md");
 
 #[derive(Debug, Clone, Copy)]
 pub struct PromptKey {
@@ -69,4 +70,13 @@ pub fn load_fill_template(prompts_dir: &Path) -> Result<String> {
             .with_context(|| format!("read override prompt {override_path:?}"));
     }
     Ok(FILL.to_string())
+}
+
+pub fn load_title_template(prompts_dir: &Path) -> Result<String> {
+    let override_path = prompts_dir.join("title.md");
+    if override_path.exists() {
+        return std::fs::read_to_string(&override_path)
+            .with_context(|| format!("read override prompt {override_path:?}"));
+    }
+    Ok(TITLE.to_string())
 }

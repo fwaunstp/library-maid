@@ -307,6 +307,98 @@ impl LlmClient {
 }
 
 impl LlmClient {
+    /// Stream `count` title candidates in a single API call. The model returns
+    /// `# #1\n…\n# #2\n…` blocks; each block's body is one title.
+    pub async fn stream_titles<F: FnMut(&str) + Send>(
+        &self,
+        prompts_dir: &Path,
+        story: &Story,
+        ideas: &[Idea],
+        count: u32,
+        cancel: Arc<AtomicBool>,
+        mut on_delta: F,
+    ) -> Result<String> {
+        let count = count.max(1);
+        let template = prompts::load_title_template(prompts_dir)?;
+        let active = resolve_active_ideas(ideas, &story.meta.active_ideas);
+        let ideas_block = format_ideas(&active);
+        let body_block = if story.body.trim().is_empty() {
+            "(empty draft)".to_string()
+        } else {
+            story.body.clone()
+        };
+        let count_str = count.to_string();
+        let user_prompt = prompts::render(
+            &template,
+            &[
+                ("ideas", &ideas_block),
+                ("body", &body_block),
+                ("count", &count_str),
+            ],
+        );
+
+        let mut builder = CreateChatCompletionRequestArgs::default();
+        builder
+            .model(&self.cfg.model)
+            .temperature(self.cfg.temperature)
+            .top_p(self.cfg.top_p)
+            .max_tokens(self.cfg.max_tokens)
+            .messages([ChatCompletionRequestUserMessageArgs::default()
+                .content(user_prompt)
+                .build()?
+                .into()]);
+        if self.cfg.disable_thinking {
+            builder.reasoning_effort(ReasoningEffort::None);
+        }
+        let request = builder.build()?;
+
+        let mut stream = self
+            .client
+            .chat()
+            .create_stream(request)
+            .await
+            .context("title create_stream failed")?;
+
+        let mut accumulated = String::new();
+        let mut last_finish: Option<FinishReason> = None;
+        while let Some(chunk) = stream.next().await {
+            if cancel.load(Ordering::SeqCst) {
+                return Ok(accumulated);
+            }
+            let chunk = chunk.context("stream chunk error")?;
+            for choice in chunk.choices {
+                if let Some(reason) = choice.finish_reason {
+                    last_finish = Some(reason);
+                }
+                if let Some(content) = choice.delta.content {
+                    if !content.is_empty() {
+                        accumulated.push_str(&content);
+                        on_delta(&content);
+                    }
+                }
+            }
+        }
+
+        let visible = visible_text(&accumulated).0;
+        if visible.trim().is_empty() {
+            let hint = match last_finish {
+                Some(FinishReason::Length) => {
+                    "max_tokens に達した。設定の max_tokens を増やしてください"
+                }
+                Some(FinishReason::ContentFilter) => {
+                    "content_filter で削除された (NSFW 拒否)。別モデルを検討してください"
+                }
+                _ => "プロンプト形式やテンプレートを確認してください",
+            };
+            return Err(anyhow::anyhow!(
+                "empty visible content (finish_reason={last_finish:?})\n→ {hint}"
+            ));
+        }
+        Ok(accumulated)
+    }
+}
+
+impl LlmClient {
     /// Stream a single fill-in proposal that covers every `<!-- FILL: ... -->`
     /// marker in `story.body`. The model receives the body with FILL markers
     /// replaced by `[FILL #N: hint]` and must answer with `# #N` blocks.

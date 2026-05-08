@@ -226,6 +226,14 @@ pub fn story_editor(state: &mut AppState, ui: &mut egui::Ui, id: Ulid) {
     // ----- meta row -----
     let mut delete_requested = false;
     let mut commit_story = false;
+    let mut do_title_gen = false;
+
+    let title_busy = state
+        .editors
+        .get(&id)
+        .map(|e| e.title_generating)
+        .unwrap_or(false);
+    let any_busy = state.editors.get(&id).map(|e| e.busy()).unwrap_or(false);
 
     ui.horizontal(|ui| {
         let s = state.story_mut(id).unwrap();
@@ -236,6 +244,19 @@ pub fn story_editor(state: &mut AppState, ui: &mut egui::Ui, id: Ulid) {
         );
         if resp.lost_focus() {
             commit_story = true;
+        }
+
+        let title_label = if title_busy {
+            "タイトル生成中…"
+        } else {
+            "タイトル生成"
+        };
+        if ui
+            .add_enabled(!any_busy, egui::Button::new(title_label))
+            .on_hover_text("本文と設定からタイトル候補を生成")
+            .clicked()
+        {
+            do_title_gen = true;
         }
 
         if ui.checkbox(&mut s.meta.nsfw, "NSFW").changed() {
@@ -266,6 +287,11 @@ pub fn story_editor(state: &mut AppState, ui: &mut egui::Ui, id: Ulid) {
     if commit_story {
         state.save_story_now(id);
     }
+    if do_title_gen {
+        spawn_title(state, id);
+    }
+
+    title_proposals_row(state, ui, id);
 
     // ----- active idea chips -----
     let chips: Vec<(Ulid, String, bool, bool)> = {
@@ -339,7 +365,7 @@ fn gen_panel(state: &mut AppState, ui: &mut egui::Ui, id: Ulid) {
     let (busy_general, busy_fill, count_now) = {
         let ed = state.editors.get(&id).unwrap();
         (
-            ed.generating || ed.auto_running || ed.compacting,
+            ed.generating || ed.auto_running || ed.compacting || ed.title_generating,
             ed.fill_generating,
             ed.count,
         )
@@ -565,6 +591,103 @@ fn gen_panel(state: &mut AppState, ui: &mut egui::Ui, id: Ulid) {
     let fills = state.editors.get(&id).map(|e| e.fill_proposals.clone()).unwrap_or_default();
     for prop in &fills {
         fill_proposal_card(state, ui, id, prop);
+    }
+}
+
+fn title_proposals_row(state: &mut AppState, ui: &mut egui::Ui, id: Ulid) {
+    let (generating, live, candidates, error) = {
+        let Some(ed) = state.editors.get(&id) else {
+            return;
+        };
+        (
+            ed.title_generating,
+            ed.title_live.clone(),
+            ed.title_candidates.clone(),
+            ed.title_error.clone(),
+        )
+    };
+
+    if !generating && candidates.is_empty() && error.is_none() {
+        return;
+    }
+
+    let mut clear_error = false;
+    let mut discard_all = false;
+    let mut do_cancel = false;
+    let mut chosen: Option<String> = None;
+
+    if let Some(err) = error {
+        if error_banner(ui, &format!("タイトル生成失敗: {err}")) {
+            clear_error = true;
+        }
+    } else if generating {
+        let visible = visible_text(&live).0;
+        let preview: String = visible.lines().take(3).collect::<Vec<_>>().join(" / ");
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("タイトル生成中…")
+                    .small()
+                    .color(theme::SUBTLE_TEXT),
+            );
+            if !preview.trim().is_empty() {
+                ui.label(
+                    egui::RichText::new(preview)
+                        .small()
+                        .color(theme::SUBTLE_TEXT),
+                );
+            }
+            if theme::danger_button(ui, "中止").clicked() {
+                do_cancel = true;
+            }
+        });
+    } else if !candidates.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("タイトル候補")
+                    .small()
+                    .color(theme::SUBTLE_TEXT),
+            );
+            for cand in &candidates {
+                let btn = egui::Button::new(cand)
+                    .fill(egui::Color32::from_rgb(0x2a, 0x2d, 0x33))
+                    .corner_radius(egui::CornerRadius::same(12));
+                let resp = ui
+                    .add(btn)
+                    .on_hover_text("クリックでタイトルに採用");
+                if resp.clicked() {
+                    chosen = Some(cand.clone());
+                }
+            }
+            if ui.button("破棄").clicked() {
+                discard_all = true;
+            }
+        });
+    }
+
+    if clear_error {
+        if let Some(ed) = state.editors.get_mut(&id) {
+            ed.title_error = None;
+        }
+    }
+    if do_cancel {
+        if let Some(ed) = state.editors.get(&id) {
+            ed.cancel_flag.store(true, Ordering::SeqCst);
+        }
+    }
+    if let Some(title) = chosen {
+        if let Some(s) = state.story_mut(id) {
+            s.meta.title = title;
+            s.meta.updated_at = chrono::Utc::now();
+        }
+        state.save_story_now(id);
+        if let Some(ed) = state.editors.get_mut(&id) {
+            ed.title_candidates.clear();
+        }
+    }
+    if discard_all {
+        if let Some(ed) = state.editors.get_mut(&id) {
+            ed.title_candidates.clear();
+        }
     }
 }
 
@@ -1156,6 +1279,78 @@ fn spawn_fill(state: &mut AppState, id: Ulid) {
     });
 }
 
+fn spawn_title(state: &mut AppState, id: Ulid) {
+    let count;
+    let cancel;
+    let tx;
+    {
+        let ed = match state.editors.get_mut(&id) {
+            Some(e) => e,
+            None => return,
+        };
+        if ed.busy() {
+            return;
+        }
+        ed.cancel_flag.store(false, Ordering::SeqCst);
+        ed.title_generating = true;
+        ed.title_live.clear();
+        ed.title_candidates.clear();
+        ed.title_error = None;
+        count = ed.count.max(1);
+        cancel = ed.cancel_flag.clone();
+        tx = ed.tx.clone();
+    }
+    let snapshot_story = match state.story(id) {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let snapshot_ideas = state.ideas.clone();
+    let llm_cfg = state.config.llm.clone();
+    let prompts_dir = state
+        .library
+        .as_ref()
+        .map(|l| l.prompts_dir())
+        .unwrap_or_default();
+    let ctx = state.egui_ctx.clone();
+
+    state.rt.spawn(async move {
+        let client = LlmClient::new(llm_cfg);
+        let tx2 = tx.clone();
+        let ctx2 = ctx.clone();
+        let on_delta = move |chunk: &str| {
+            let _ = tx2.send(StoryEvent::TitleDelta {
+                chunk: chunk.to_string(),
+            });
+            ctx2.request_repaint();
+        };
+        let result = client
+            .stream_titles(
+                &prompts_dir,
+                &snapshot_story,
+                &snapshot_ideas,
+                count,
+                cancel.clone(),
+                on_delta,
+            )
+            .await;
+        if cancel.load(Ordering::SeqCst) {
+            let _ = tx.send(StoryEvent::TitleCancelled);
+        } else {
+            match result {
+                Ok(raw) => {
+                    let _ = tx.send(StoryEvent::TitleDone { raw });
+                }
+                Err(e) => {
+                    let _ = tx.send(StoryEvent::TitleError {
+                        error: format!("{e:#}"),
+                    });
+                }
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
 // =============================================================================
 // Drain async events into UI state
 // =============================================================================
@@ -1347,6 +1542,61 @@ fn apply_event(state: &mut AppState, id: Ulid, ev: StoryEvent) {
                 }
             }
             update_fill_generating_flag(state, id);
+        }
+
+        StoryEvent::TitleDelta { chunk } => {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                ed.title_live.push_str(&chunk);
+            }
+        }
+        StoryEvent::TitleDone { raw } => {
+            let visible = visible_text(&raw).0;
+            let blocks = parse_numbered_blocks(&visible);
+            let mut keys: Vec<usize> = blocks.keys().copied().collect();
+            keys.sort();
+            let mut titles: Vec<String> = keys
+                .iter()
+                .filter_map(|k| {
+                    let body = strip_author_notes(&blocks[k]);
+                    body.lines()
+                        .map(|l| l.trim())
+                        .find(|l| !l.is_empty())
+                        .map(|l| l.to_string())
+                })
+                .collect();
+            // Fallback: if the model ignored the format, take the first non-empty line.
+            if titles.is_empty() {
+                if let Some(line) = strip_author_notes(&visible)
+                    .lines()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty())
+                {
+                    titles.push(line.to_string());
+                }
+            }
+            if let Some(ed) = state.editors.get_mut(&id) {
+                ed.title_candidates = titles;
+                ed.title_live.clear();
+                ed.title_generating = false;
+                if ed.title_candidates.is_empty() {
+                    ed.title_error =
+                        Some("候補を解析できませんでした。プロンプトやモデルを確認してください".into());
+                }
+            }
+        }
+        StoryEvent::TitleError { error } => {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                ed.title_error = Some(error);
+                ed.title_live.clear();
+                ed.title_generating = false;
+            }
+        }
+        StoryEvent::TitleCancelled => {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                ed.title_live.clear();
+                ed.title_candidates.clear();
+                ed.title_generating = false;
+            }
         }
     }
 }

@@ -79,6 +79,11 @@ pub enum StoryEvent {
     FillDone { pid: u64, raw: String },
     FillError { pid: u64, error: String },
     FillCancelled { pid: u64 },
+
+    TitleDelta { chunk: String },
+    TitleDone { raw: String },
+    TitleError { error: String },
+    TitleCancelled,
 }
 
 pub struct StoryEditorState {
@@ -98,6 +103,11 @@ pub struct StoryEditorState {
 
     pub fill_generating: bool,
     pub fill_error: Option<String>,
+
+    pub title_generating: bool,
+    pub title_live: String,
+    pub title_candidates: Vec<String>,
+    pub title_error: Option<String>,
 
     pub cancel_flag: Arc<AtomicBool>,
     pub tx: mpsc::Sender<StoryEvent>,
@@ -121,6 +131,10 @@ impl StoryEditorState {
             compact_error: None,
             fill_generating: false,
             fill_error: None,
+            title_generating: false,
+            title_live: String::new(),
+            title_candidates: Vec::new(),
+            title_error: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             tx,
             rx,
@@ -134,7 +148,11 @@ impl StoryEditorState {
     }
 
     pub fn busy(&self) -> bool {
-        self.generating || self.auto_running || self.compacting || self.fill_generating
+        self.generating
+            || self.auto_running
+            || self.compacting
+            || self.fill_generating
+            || self.title_generating
     }
 }
 
