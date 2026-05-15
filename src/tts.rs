@@ -30,11 +30,6 @@ impl Default for TtsConfig {
 impl TtsConfig {
     /// POST /audio/speech and return the raw mp3 bytes.
     pub async fn synthesize(&self, text: &str) -> Result<Vec<u8>> {
-        if self.api_key.trim().is_empty() {
-            return Err(anyhow::anyhow!(
-                "TTS API キーが未設定です。設定 → TTS 接続 で入力してください"
-            ));
-        }
         let url = format!("{}/audio/speech", self.api_base.trim_end_matches('/'));
         let body = serde_json::json!({
             "model": self.model,
@@ -46,10 +41,13 @@ impl TtsConfig {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()?;
-        let resp = client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
+        // Only attach a bearer token when the user actually configured one —
+        // compatible local servers often reject any Authorization header.
+        let mut req = client.post(&url).json(&body);
+        if !self.api_key.trim().is_empty() {
+            req = req.bearer_auth(&self.api_key);
+        }
+        let resp = req
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;

@@ -208,7 +208,7 @@ pub fn tts_settings(state: &mut AppState, ui: &mut egui::Ui) {
         text_field(
             ui,
             "API Key",
-            "OpenAI の sk-... など。空欄では再生不可",
+            "OpenAI の sk-... など。互換サーバなら空欄可 (Authorization ヘッダ自体を送りません)",
             &mut state.config.tts.api_key,
             &mut commit,
         );
