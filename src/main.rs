@@ -4,6 +4,7 @@ mod config;
 mod data;
 mod llm;
 mod prompts;
+mod tts;
 mod ui;
 
 fn main() -> eframe::Result<()> {

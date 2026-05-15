@@ -1,6 +1,7 @@
 use super::state::{AppState, ProbeState, SettingsEvent};
 use super::theme;
 use crate::llm::LlmConfig;
+use crate::tts::TtsConfig;
 
 pub fn drain_settings_events(state: &mut AppState) {
     let mut events = Vec::new();
@@ -176,6 +177,73 @@ pub fn llm_settings(state: &mut AppState, ui: &mut egui::Ui) {
         }
         if let Some(m) = model_to_apply {
             state.config.llm.model = m;
+            if let Err(e) = state.save_config() {
+                tracing::error!(?e, "save config");
+            }
+        }
+    });
+}
+
+pub fn tts_settings(state: &mut AppState, ui: &mut egui::Ui) {
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        ui.heading("TTS 接続 (読み上げ)");
+        ui.label(
+            egui::RichText::new(
+                "OpenAI 互換の /v1/audio/speech エンドポイントに接続します。\
+                 既定は OpenAI 公式 (gpt-4o-mini-tts, voice=alloy)。\
+                 互換サーバを使う場合は API Base URL を書き換えてください。",
+            )
+            .color(theme::SUBTLE_TEXT),
+        );
+        ui.add_space(8.0);
+
+        let mut commit = false;
+        text_field(
+            ui,
+            "API Base URL",
+            "例: https://api.openai.com/v1",
+            &mut state.config.tts.api_base,
+            &mut commit,
+        );
+        text_field(
+            ui,
+            "API Key",
+            "OpenAI の sk-... など。空欄では再生不可",
+            &mut state.config.tts.api_key,
+            &mut commit,
+        );
+        text_field(
+            ui,
+            "モデル",
+            "OpenAI: tts-1 / tts-1-hd / gpt-4o-mini-tts",
+            &mut state.config.tts.model,
+            &mut commit,
+        );
+        text_field(
+            ui,
+            "Voice",
+            "OpenAI: alloy / ash / ballad / coral / echo / fable / nova / onyx / sage / shimmer",
+            &mut state.config.tts.voice,
+            &mut commit,
+        );
+        f32_field(
+            ui,
+            "速度",
+            "0.25 ~ 4.0。1.0 が等速",
+            &mut state.config.tts.speed,
+            0.05,
+            &mut commit,
+        );
+
+        if commit {
+            if let Err(e) = state.save_config() {
+                tracing::error!(?e, "save config");
+            }
+        }
+
+        ui.add_space(12.0);
+        if ui.button("デフォルトに戻す").clicked() {
+            state.config.tts = TtsConfig::default();
             if let Err(e) = state.save_config() {
                 tracing::error!(?e, "save config");
             }

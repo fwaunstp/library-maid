@@ -26,6 +26,7 @@ impl Default for Tab {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Llm,
+    Tts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +85,9 @@ pub enum StoryEvent {
     TitleDone { raw: String },
     TitleError { error: String },
     TitleCancelled,
+
+    TtsDone,
+    TtsError { error: String },
 }
 
 pub struct StoryEditorState {
@@ -108,6 +112,18 @@ pub struct StoryEditorState {
     pub title_live: String,
     pub title_candidates: Vec<String>,
     pub title_error: Option<String>,
+
+    /// TTS playback state. `tts_cancel` is separate from `cancel_flag` because
+    /// audio playback shouldn't be interrupted by generation cancel buttons,
+    /// and vice versa.
+    pub tts_playing: bool,
+    pub tts_error: Option<String>,
+    pub tts_cancel: Arc<AtomicBool>,
+
+    /// Latest text selection inside the body TextEdit, as *character* indices.
+    /// `None` when nothing was ever selected; `Some((a, b))` with a == b means
+    /// the caret is at that position with no range selected.
+    pub body_selection: Option<(usize, usize)>,
 
     pub cancel_flag: Arc<AtomicBool>,
     pub tx: mpsc::Sender<StoryEvent>,
@@ -135,6 +151,10 @@ impl StoryEditorState {
             title_live: String::new(),
             title_candidates: Vec::new(),
             title_error: None,
+            tts_playing: false,
+            tts_error: None,
+            tts_cancel: Arc::new(AtomicBool::new(false)),
+            body_selection: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             tx,
             rx,

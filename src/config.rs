@@ -1,4 +1,5 @@
 use crate::llm::LlmConfig;
+use crate::tts::TtsConfig;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,7 @@ const APP: &str = "library-maid";
 pub struct AppConfig {
     pub data_dir: Option<PathBuf>,
     pub llm: LlmConfig,
+    pub tts: TtsConfig,
 }
 
 impl AppConfig {

@@ -6,7 +6,8 @@ use crate::llm::{
     LlmClient, apply_fills, extract_fills, parse_numbered_blocks, resolve_active_ideas,
     strip_author_notes, visible_text,
 };
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use ulid::Ulid;
 
 pub fn idea_editor(state: &mut AppState, ui: &mut egui::Ui, id: Ulid) {
@@ -340,18 +341,33 @@ pub fn story_editor(state: &mut AppState, ui: &mut egui::Ui, id: Ulid) {
     ui.separator();
 
     // Body (fixed rows; outer ScrollArea in library.rs handles overflow).
-    {
+    // Use `.show(ui)` instead of `ui.add(...)` so we can read the selection
+    // range out of the TextEditOutput.
+    let (lost_focus, selection) = {
         let s = state.story_mut(id).unwrap();
-        let resp = ui.add(
-            egui::TextEdit::multiline(&mut s.body)
-                .desired_width(f32::INFINITY)
-                .desired_rows(18)
-                .font(egui::TextStyle::Monospace),
-        );
-        if resp.lost_focus() {
-            state.save_story_now(id);
+        let output = egui::TextEdit::multiline(&mut s.body)
+            .desired_width(f32::INFINITY)
+            .desired_rows(18)
+            .font(egui::TextStyle::Monospace)
+            .show(ui);
+        let sel = output
+            .cursor_range
+            .map(|r| (r.primary.index, r.secondary.index));
+        (output.response.lost_focus(), sel)
+    };
+    if let Some(ed) = state.editors.get_mut(&id) {
+        // Only overwrite when egui reports a selection; otherwise keep the
+        // last known one so the read-aloud button still works after the
+        // TextEdit loses focus.
+        if selection.is_some() {
+            ed.body_selection = selection;
         }
     }
+    if lost_focus {
+        state.save_story_now(id);
+    }
+
+    tts_panel(state, ui, id);
 
     ui.separator();
 
@@ -591,6 +607,64 @@ fn gen_panel(state: &mut AppState, ui: &mut egui::Ui, id: Ulid) {
     let fills = state.editors.get(&id).map(|e| e.fill_proposals.clone()).unwrap_or_default();
     for prop in &fills {
         fill_proposal_card(state, ui, id, prop);
+    }
+}
+
+fn tts_panel(state: &mut AppState, ui: &mut egui::Ui, id: Ulid) {
+    let (playing, error, selection) = {
+        let Some(ed) = state.editors.get(&id) else { return; };
+        (ed.tts_playing, ed.tts_error.clone(), ed.body_selection)
+    };
+    let has_selection = matches!(selection, Some((a, b)) if a != b);
+
+    let mut do_play = false;
+    let mut do_stop = false;
+    let mut clear_error = false;
+
+    ui.horizontal(|ui| {
+        let label = if has_selection {
+            "🔊 選択範囲を読み上げ"
+        } else {
+            "🔊 カーソル位置の段落を読み上げ"
+        };
+        if ui
+            .add_enabled(!playing, egui::Button::new(label))
+            .on_hover_text(
+                "選択範囲があれば優先。なければカーソル位置の段落、それも空なら行を読み上げます。",
+            )
+            .clicked()
+        {
+            do_play = true;
+        }
+        if playing {
+            if theme::danger_button(ui, "⏹ 停止").clicked() {
+                do_stop = true;
+            }
+            ui.label(
+                egui::RichText::new("読み上げ中…")
+                    .small()
+                    .color(theme::SUBTLE_TEXT),
+            );
+        }
+    });
+    if let Some(err) = error {
+        if error_banner(ui, &format!("読み上げ失敗: {err}")) {
+            clear_error = true;
+        }
+    }
+
+    if clear_error {
+        if let Some(ed) = state.editors.get_mut(&id) {
+            ed.tts_error = None;
+        }
+    }
+    if do_stop {
+        if let Some(ed) = state.editors.get(&id) {
+            ed.tts_cancel.store(true, Ordering::SeqCst);
+        }
+    }
+    if do_play {
+        spawn_tts(state, id);
     }
 }
 
@@ -1279,6 +1353,78 @@ fn spawn_fill(state: &mut AppState, id: Ulid) {
     });
 }
 
+fn spawn_tts(state: &mut AppState, id: Ulid) {
+    let selection = state.editors.get(&id).and_then(|ed| ed.body_selection);
+    let cursor = selection.map(|(primary, _)| primary);
+    let text = state
+        .story(id)
+        .and_then(|s| crate::tts::pick_speech_text(&s.body, selection, cursor));
+    let Some(text) = text else {
+        if let Some(ed) = state.editors.get_mut(&id) {
+            ed.tts_error = Some(
+                "読み上げ対象がありません。本文に文章を書くか、範囲を選択してください。".into(),
+            );
+        }
+        return;
+    };
+
+    let tx;
+    let cancel;
+    {
+        let Some(ed) = state.editors.get_mut(&id) else {
+            return;
+        };
+        if ed.tts_playing {
+            return;
+        }
+        ed.tts_playing = true;
+        ed.tts_error = None;
+        // Fresh cancel flag per playback so a previous "stopped" state doesn't
+        // immediately abort the new one.
+        ed.tts_cancel = Arc::new(AtomicBool::new(false));
+        tx = ed.tx.clone();
+        cancel = ed.tts_cancel.clone();
+    }
+
+    let tts_cfg = state.config.tts.clone();
+    let ctx = state.egui_ctx.clone();
+
+    state.rt.spawn(async move {
+        tracing::info!(chars = text.chars().count(), "tts: synthesize start");
+        let bytes = match tts_cfg.synthesize(&text).await {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = tx.send(StoryEvent::TtsError {
+                    error: format!("{e:#}"),
+                });
+                ctx.request_repaint();
+                return;
+            }
+        };
+        let cancel2 = cancel.clone();
+        let play_res = tokio::task::spawn_blocking(move || {
+            crate::tts::play_blocking(bytes, cancel2)
+        })
+        .await;
+        match play_res {
+            Ok(Ok(())) => {
+                let _ = tx.send(StoryEvent::TtsDone);
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(StoryEvent::TtsError {
+                    error: format!("{e:#}"),
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(StoryEvent::TtsError {
+                    error: format!("playback task panicked: {e}"),
+                });
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
 fn spawn_title(state: &mut AppState, id: Ulid) {
     let count;
     let cancel;
@@ -1596,6 +1742,18 @@ fn apply_event(state: &mut AppState, id: Ulid, ev: StoryEvent) {
                 ed.title_live.clear();
                 ed.title_candidates.clear();
                 ed.title_generating = false;
+            }
+        }
+
+        StoryEvent::TtsDone => {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                ed.tts_playing = false;
+            }
+        }
+        StoryEvent::TtsError { error } => {
+            if let Some(ed) = state.editors.get_mut(&id) {
+                ed.tts_playing = false;
+                ed.tts_error = Some(error);
             }
         }
     }

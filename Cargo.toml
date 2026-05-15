@@ -21,6 +21,7 @@ ulid = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
 rfd = "0.17"
+rodio = { version = "0.22", default-features = false, features = ["playback", "mp3"] }
 
 anyhow = "1"
 thiserror = "2"

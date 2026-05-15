@@ -40,6 +40,7 @@ pub fn show(state: &mut AppState, ctx: &egui::Context) {
                 Selection::Category(id) => editors::category_editor(state, ui, id),
                 Selection::Story(id) => editors::story_editor(state, ui, id),
                 Selection::Settings(SettingsSection::Llm) => settings::llm_settings(state, ui),
+                Selection::Settings(SettingsSection::Tts) => settings::tts_settings(state, ui),
                 Selection::None => {
                     ui.vertical_centered(|ui| {
                         ui.add_space(80.0);
@@ -110,9 +111,13 @@ fn list(state: &mut AppState, ui: &mut egui::Ui) {
 }
 
 fn settings_list(state: &mut AppState, ui: &mut egui::Ui) {
-    let selected = matches!(state.selection, Selection::Settings(SettingsSection::Llm));
-    list_row(ui, selected, "LLM 接続", "llama.cpp サーバーのエンドポイント等", || {
+    let llm_selected = matches!(state.selection, Selection::Settings(SettingsSection::Llm));
+    list_row(ui, llm_selected, "LLM 接続", "llama.cpp サーバーのエンドポイント等", || {
         state.selection = Selection::Settings(SettingsSection::Llm);
+    });
+    let tts_selected = matches!(state.selection, Selection::Settings(SettingsSection::Tts));
+    list_row(ui, tts_selected, "TTS 接続", "読み上げ用 (OpenAI /audio/speech)", || {
+        state.selection = Selection::Settings(SettingsSection::Tts);
     });
 }
 
